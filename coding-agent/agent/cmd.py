@@ -1,5 +1,4 @@
 import json
-import sys
 from typing import Any
 from rich.console import Console
 from rich.table import Table
@@ -79,7 +78,7 @@ async def run_cmd(args: list[str], mcp: LangflowMCPClient, pretty: bool = True) 
             result = await mcp.call_tool("list_folders", {"page": page, "limit": limit})
             _print(result, pretty)
         else:
-            raise CmdError(f"Unknown folder action '{action}'.")
+            raise CmdError(f"Unknown folder action '{action}'. Available: list")
 
     else:
         raise CmdError(f"Unknown command '{entity}'. Available: flow, folder, health")
@@ -93,12 +92,17 @@ def _require_arg(args: list[str], idx: int, usage: str) -> None:
 def _flag(args: list[str], flag: str, default: Any = None, cast: type = str, required: bool = False) -> Any:
     try:
         idx = args.index(flag)
-        val = cast(args[idx + 1])
-        return val
-    except (ValueError, IndexError):
+    except ValueError:
         if required:
             raise CmdError(f"Required flag {flag} not provided.")
         return default
+
+    try:
+        return cast(args[idx + 1])
+    except IndexError:
+        raise CmdError(f"Flag {flag} requires a value.")
+    except (ValueError, TypeError):
+        raise CmdError(f"Invalid value for {flag}: expected {cast.__name__}.")
 
 
 def _print(result: Any, pretty: bool) -> None:
