@@ -10,6 +10,27 @@ from agent.prompts import SYSTEM_PROMPT
 console = Console()
 
 
+def _inject_node_check(get_flow_result: str | None) -> str:
+    """Append a hard verification note when a post-build get_flow returns 0 nodes."""
+    if not get_flow_result:
+        return get_flow_result or "null"
+    try:
+        data = json.loads(get_flow_result)
+        nodes = data.get("data", {}).get("nodes", []) if isinstance(data, dict) else []
+        if len(nodes) == 0:
+            return (
+                get_flow_result
+                + "\n\n⚠ VERIFICATION FAILED: 0 nodes in flow after build. "
+                "All your node type strings were rejected by Langflow. "
+                "Call list_components again, read the exact 'type' field values from the response, "
+                "write them out explicitly, then retry update_flow with ONLY those type strings. "
+                "Do NOT report success until node count > 0."
+            )
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return get_flow_result
+
+
 def _tool_result_message(tool_call_id: str, result: str | None) -> dict:
     return {
         "role": "tool",
@@ -82,11 +103,21 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                 messages.append(_assistant_tool_call_message(response["tool_calls"]))
 
+                _last_build_flow_id: str | None = None
                 for tc in response["tool_calls"]:
                     try:
                         result = await mcp.call_tool(tc["name"], tc["arguments"])
                     except Exception as e:
                         result = f"ERROR: {e}"
+
+                    if tc["name"] == "build_flow":
+                        _last_build_flow_id = tc["arguments"].get("flow_id")
+
+                    # After get_flow following a build: enforce node count check
+                    if tc["name"] == "get_flow" and _last_build_flow_id:
+                        result = _inject_node_check(result)
+                        _last_build_flow_id = None
+
                     messages.append(_tool_result_message(tc["id"], str(result)))
 
                 iterations += 1

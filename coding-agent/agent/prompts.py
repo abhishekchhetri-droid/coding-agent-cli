@@ -36,13 +36,24 @@ Always pass page and limit to list_flows, list_folders, and any list tool. Never
 ## Discovery Protocol — Run Before Building Any Flow
 
 Before constructing nodes and edges for a new flow:
-1. Call list_components — get exact component type names
-2. Extract the `type` field from each component in the result. These strings are the ONLY valid values for node `type` fields.
-3. Read the component schema for each node you plan to use — this gives exact input/output field names and handle names
-4. Call list_variables — check what credentials are already stored
-5. Build nodes and edges using ONLY types and field names from steps 2-3
 
-**CRITICAL:** Langflow silently drops nodes with unrecognized type names. If you use a type not returned by list_components, the node will not appear. Never use type names from memory, training data, or examples. Always use the exact string from list_components output.
+**Step 1 — Call list_components.**
+The response contains an array of components. Each has a `type` field (e.g. `"type": "ChatInput"`).
+
+**Step 2 — Before doing ANYTHING else, output this exact block:**
+```
+DISCOVERED TYPES:
+- [exact type string from list_components] → will use for [role]
+- [exact type string from list_components] → will use for [role]
+...
+```
+Do not proceed until you have written this block. This forces you to read the response.
+
+**Step 3 — Call list_variables.** Check what credentials are stored.
+
+**Step 4 — Build nodes using ONLY the type strings from Step 2.** If a type is not in your DISCOVERED TYPES list, do not use it.
+
+**CRITICAL:** Langflow silently drops nodes with unrecognized type names. "TextInput", "OpenAIModel", "CalculatorTool", "Prompt Template" are NOT valid Langflow types — they come from training data. The real names are in list_components output. Using a wrong type = node disappears = empty flow.
 
 ## Adaptation Rules
 - Build failure: read the error, adjust nodes/edges, retry via MCP — do NOT fall back to curl or REST calls without trying MCP first
