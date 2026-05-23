@@ -1,4 +1,5 @@
 import os
+from contextlib import AsyncExitStack
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -15,19 +16,24 @@ class LangflowMCPClient:
         }
         self._session: ClientSession | None = None
         self._tools_cache: list[Any] = []
-        self._exit_stack = None
+        self._exit_stack: AsyncExitStack | None = None
 
     async def connect(self) -> None:
-        from contextlib import AsyncExitStack
         self._exit_stack = AsyncExitStack()
         params = StdioServerParameters(
             command="node",
             args=[self._mcp_path],
             env=self._env,
         )
-        stdio_transport = await self._exit_stack.enter_async_context(
-            stdio_client(params)
-        )
+        try:
+            stdio_transport = await self._exit_stack.enter_async_context(
+                stdio_client(params)
+            )
+        except FileNotFoundError:
+            raise RuntimeError("'node' binary not found. Install Node.js to run langflow-mcp.") from None
+        except Exception as e:
+            raise RuntimeError(f"Failed to start langflow-mcp server: {e}") from e
+
         read, write = stdio_transport
         self._session = await self._exit_stack.enter_async_context(
             ClientSession(read, write)
@@ -53,9 +59,12 @@ class LangflowMCPClient:
         if self._session is None:
             raise RuntimeError("MCP client not connected. Call connect() first.")
         result = await self._session.call_tool(name, arguments)
-        if result.content:
-            return result.content[0].text if hasattr(result.content[0], "text") else result.content
-        return None
+        if not result.content:
+            return None
+        item = result.content[0]
+        if hasattr(item, "text"):
+            return item.text
+        return str(item)
 
     async def close(self) -> None:
         if self._exit_stack:
