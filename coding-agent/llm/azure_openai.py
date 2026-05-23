@@ -39,16 +39,22 @@ class AzureOpenAIProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
 
         response = await self._client.chat.completions.create(**kwargs)
+        if not response.choices:
+            raise ValueError("No completion choices returned from Azure OpenAI")
         choice = response.choices[0]
         msg = choice.message
 
         tool_calls: list[ToolCall] = []
         if msg.tool_calls:
             for tc in msg.tool_calls:
+                try:
+                    arguments = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Failed to parse tool arguments for {tc.function.name}: {e}") from e
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments),
+                    "arguments": arguments,
                 })
 
         return {
