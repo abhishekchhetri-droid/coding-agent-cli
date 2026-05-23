@@ -1,5 +1,6 @@
 # Python-generated files
 __pycache__/
+.pytest_cache
 *.py[oc]
 build/
 dist/
@@ -16,3 +17,7 @@ docs/
 
 # Secrets
 .env
+
+# agent logs
+coding-agent/logs/*.log
+

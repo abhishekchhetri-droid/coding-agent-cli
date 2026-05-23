@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import sys
+from pathlib import Path
 from config.settings import Settings
 from mcpbridge.client import LangflowMCPClient
 from agent.cmd import run_cmd, CmdError
@@ -11,6 +13,15 @@ def main() -> None:
 
 
 async def _main(settings: Settings) -> None:
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    logging.basicConfig(
+        filename=str(log_dir / "agent.log"),
+        level=logging.ERROR,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
     mcp = LangflowMCPClient(
         mcp_path=settings.langflow_mcp_path,
         langflow_api_key=settings.langflow_api_key,
@@ -52,6 +63,10 @@ async def _main(settings: Settings) -> None:
             llm = get_provider(settings)
             await run_chat(llm, mcp, settings)
 
+    except Exception as e:
+        logging.exception("Unhandled error in agent")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     finally:
         await mcp.close()
 
