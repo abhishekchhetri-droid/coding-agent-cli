@@ -13,6 +13,8 @@ class LangflowMCPClient:
             **os.environ,
             "LANGFLOW_API_KEY": langflow_api_key,
             "LANGFLOW_BASE_URL": langflow_base_url,
+            "DOTENV_CONFIG_QUIET": "true",  # suppress dotenvx stdout banner (JSONRPC channel noise)
+            "LOG_LEVEL": "error",  # suppress langflow-mcp startup info logs from stdout
         }
         self._session: ClientSession | None = None
         self._tools_cache: list[Any] = []
@@ -68,6 +70,10 @@ class LangflowMCPClient:
 
     async def close(self) -> None:
         if self._exit_stack:
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-            self._session = None
+            try:
+                await self._exit_stack.aclose()
+            except Exception:
+                pass  # suppress ExceptionGroup from JSONRPC parse errors on shutdown
+            finally:
+                self._exit_stack = None
+                self._session = None

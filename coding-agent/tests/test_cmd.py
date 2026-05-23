@@ -10,7 +10,7 @@ async def test_cmd_flow_list_calls_mcp():
     mock_mcp.call_tool = AsyncMock(return_value='[{"id": "abc", "name": "test"}]')
 
     await run_cmd(["flow", "list"], mock_mcp, pretty=False)
-    mock_mcp.call_tool.assert_called_once_with("list_flows", {"page": 1, "limit": 20})
+    mock_mcp.call_tool.assert_called_once_with("list_flows", {"page": 1, "size": 20})
 
 
 @pytest.mark.asyncio

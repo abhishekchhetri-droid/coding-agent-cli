@@ -28,8 +28,8 @@ async def run_cmd(args: list[str], mcp: LangflowMCPClient, pretty: bool = True) 
 
         if action == "list":
             page = _flag(args, "--page", default=1, cast=int)
-            limit = _flag(args, "--limit", default=20, cast=int)
-            result = await mcp.call_tool("list_flows", {"page": page, "limit": limit})
+            size = _flag(args, "--size", default=20, cast=int)
+            result = await mcp.call_tool("list_flows", {"page": page, "size": size})
             _print(result, pretty)
 
         elif action == "get":
@@ -74,8 +74,8 @@ async def run_cmd(args: list[str], mcp: LangflowMCPClient, pretty: bool = True) 
         action = args[1]
         if action == "list":
             page = _flag(args, "--page", default=1, cast=int)
-            limit = _flag(args, "--limit", default=20, cast=int)
-            result = await mcp.call_tool("list_folders", {"page": page, "limit": limit})
+            size = _flag(args, "--size", default=20, cast=int)
+            result = await mcp.call_tool("list_folders", {"page": page, "size": size})
             _print(result, pretty)
         else:
             raise CmdError(f"Unknown folder action '{action}'. Available: list")
