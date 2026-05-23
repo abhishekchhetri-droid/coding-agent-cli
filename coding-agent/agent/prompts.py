@@ -53,7 +53,41 @@ Do not proceed until you have written this block. This forces you to read the re
 
 **Step 4 — Build nodes using ONLY the type strings from Step 2.** If a type is not in your DISCOVERED TYPES list, do not use it.
 
+Each node structure:
+```json
+{
+  "id": "<unique_node_id>",
+  "type": "<ComponentType from list_components>",
+  "position": {"x": 0, "y": 0},
+  "data": {
+    "type": "<ComponentType>",
+    "id": "<same unique_node_id>"
+  }
+}
+```
+The agent layer automatically injects the full component schema into `data.node` — you do not need to construct it. Just provide `type`, `id`, and `position`.
+
 **CRITICAL:** Langflow silently drops nodes with unrecognized type names. "TextInput", "OpenAIModel", "CalculatorTool", "Prompt Template" are NOT valid Langflow types — they come from training data. The real names are in list_components output. Using a wrong type = node disappears = empty flow.
+
+## Edge Wiring Rules (from real component schemas)
+
+Always check actual output/input names from list_components before wiring:
+
+| Component | Key Outputs | Key Inputs |
+|-----------|------------|-----------|
+| ChatInput | `message` (Message) | — |
+| ChatOutput | — | `input_value` (Message) |
+| ToolCallingAgent | `response` (Message) | `input_value` (Message), `model` (LanguageModel), `tools` (Tool) |
+| AzureOpenAIModel | `model_output` (LanguageModel) | `azure_endpoint`, `api_key`, `azure_deployment`, `api_version` |
+| CalculatorTool | `api_build_tool` (Tool) | `expression` |
+
+**Tool wiring direction**: Tools (CalculatorTool, PythonREPLTool, etc.) wire INTO the agent's `tools` input, not the other way.
+`CalculatorTool.api_build_tool → ToolCallingAgent.tools`
+
+**LLM wiring**: The LLM model output wires to the agent's `model` input.
+`AzureOpenAIModel.model_output → ToolCallingAgent.model`
+
+The agent layer injects full component schemas automatically — just provide correct type, id, and position in nodes.
 
 ## Adaptation Rules
 - Build failure: read the error, adjust nodes/edges, retry via MCP — do NOT fall back to curl or REST calls without trying MCP first

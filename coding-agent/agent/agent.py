@@ -110,8 +110,21 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                 _last_build_flow_id: str | None = None
                 for tc in response["tool_calls"]:
+                    args = tc["arguments"]
+
+                    # Auto-enrich nodes with full component schemas before sending to Langflow
+                    if tc["name"] in ("update_flow", "create_flow"):
+                        data = args.get("data", {})
+                        if isinstance(data, dict) and "nodes" in data:
+                            try:
+                                data["nodes"] = mcp.enrich_nodes(data["nodes"])
+                                args = {**args, "data": data}
+                                console.print("[dim]↳ enriched nodes with component schemas[/dim]")
+                            except Exception as enrich_err:
+                                console.print(f"[yellow]⚠ schema enrichment failed: {enrich_err}[/yellow]")
+
                     try:
-                        result = await mcp.call_tool(tc["name"], tc["arguments"])
+                        result = await mcp.call_tool(tc["name"], args)
                     except Exception as e:
                         result = f"ERROR: {e}"
 
