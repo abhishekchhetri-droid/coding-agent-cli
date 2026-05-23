@@ -63,11 +63,18 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         messages.append({"role": "user", "content": user_input})
 
         iterations = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+
         while iterations < settings.max_tool_iterations:
-            response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+            with console.status("[dim]thinking…[/dim]", spinner="dots"):
+                response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+
+            if response["usage"]:
+                prompt_tokens += response["usage"]["prompt_tokens"]
+                completion_tokens += response["usage"]["completion_tokens"]
 
             if response["tool_calls"]:
-                # Show tool calls to user
                 for tc in response["tool_calls"]:
                     console.print(
                         f"[dim]→ {tc['name']}({json.dumps(tc['arguments'], indent=None)})[/dim]"
@@ -87,6 +94,10 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 if response["content"]:
                     console.print(Markdown(response["content"]))
                 messages.append({"role": "assistant", "content": response["content"]})
+                if prompt_tokens or completion_tokens:
+                    console.print(
+                        f"[dim]↑{prompt_tokens:,} ↓{completion_tokens:,} tokens[/dim]"
+                    )
                 break
         else:
             console.print("[yellow]⚠ Max tool iterations reached.[/yellow]")

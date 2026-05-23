@@ -1,6 +1,6 @@
 import json
 from openai import AsyncAzureOpenAI
-from .base import LLMProvider, LLMResponse, ToolCall
+from .base import LLMProvider, LLMResponse, ToolCall, Usage
 from config.settings import Settings
 
 
@@ -57,7 +57,16 @@ class AzureOpenAIProvider(LLMProvider):
                     "arguments": arguments,
                 })
 
+        usage: Usage | None = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+
         return {
             "content": msg.content or "",
             "tool_calls": tool_calls,
+            "usage": usage,
         }

@@ -8,9 +8,16 @@ class ToolCall(TypedDict):
     arguments: dict
 
 
+class Usage(TypedDict):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 class LLMResponse(TypedDict):
     content: str
     tool_calls: list[ToolCall]
+    usage: Usage | None
 
 
 class LLMProvider(ABC):
