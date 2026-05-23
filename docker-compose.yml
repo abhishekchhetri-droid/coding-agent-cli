@@ -1,0 +1,13 @@
+services:
+  langflow:
+    image: langflowai/langflow:latest
+    ports:
+      - "7860:7860"
+    volumes:
+      - langflow_data:/app/langflow
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  langflow_data:
