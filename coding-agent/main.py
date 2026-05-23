@@ -1,6 +1,8 @@
+import sys
+print("starting…", end="\r", flush=True)  # shown before slow MCP import
+
 import asyncio
 import logging
-import sys
 from pathlib import Path
 from config.settings import Settings
 from mcpbridge.client import LangflowMCPClient
@@ -28,7 +30,9 @@ async def _main(settings: Settings) -> None:
         langflow_base_url=settings.langflow_base_url,
     )
 
+    print("connecting…", end="\r", flush=True)
     await mcp.connect()
+    print("           ", end="\r", flush=True)  # clear the line
 
     try:
         args = sys.argv[1:]
