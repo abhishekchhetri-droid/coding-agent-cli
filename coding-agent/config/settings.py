@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     # Langflow — env var is LANGFLOW_API (not LANGFLOW_API_KEY)
     langflow_api_key: str = Field(default="", validation_alias="LANGFLOW_API")
     langflow_base_url: str = "http://localhost:7860"
-    langflow_mcp_path: str = "/home/abhishekks1369/ai/nokia/langflow-mcp/dist/mcp/index.js"
+    langflow_mcp_path: str = Field(
+        default="/home/abhishekks1369/ai/nokia/langflow-mcp/dist/mcp/index.js",
+        validation_alias="LANGFLOW_MCP_PATH",
+    )
 
     # LLM provider
     llm_provider: str = "azure_openai"
