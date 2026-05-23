@@ -1,3 +1,4 @@
+import asyncio
 import json
 from rich.console import Console
 from rich.markdown import Markdown
@@ -88,8 +89,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         completion_tokens = 0
 
         while iterations < settings.max_tool_iterations:
-            with console.status("[dim]thinking…[/dim]", spinner="dots"):
-                response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+            try:
+                with console.status("[dim]thinking…[/dim]", spinner="dots"):
+                    response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                console.print("\n[dim]Interrupted.[/dim]")
+                return
 
             if response["usage"]:
                 prompt_tokens += response["usage"]["prompt_tokens"]
