@@ -10,6 +10,27 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
+def _extract_text(obj: Any, depth: int = 0) -> str:
+    """Walk Langflow run response tree to find the first non-trivial text value."""
+    if depth > 10:
+        return ""
+    if isinstance(obj, dict):
+        for k in ("text", "message"):
+            v = obj.get(k)
+            if isinstance(v, str) and len(v) > 2:
+                return v
+        for v in obj.values():
+            r = _extract_text(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = _extract_text(item, depth + 1)
+            if r:
+                return r
+    return ""
+
+
 class LangflowMCPClient:
     def __init__(self, mcp_path: str, langflow_api_key: str, langflow_base_url: str) -> None:
         self._mcp_path = mcp_path
@@ -70,8 +91,12 @@ class LangflowMCPClient:
         self._component_schema_cache = flat
         return flat
 
-    def enrich_nodes(self, nodes: list[dict]) -> list[dict]:
-        """Inject data.node (full Langflow component schema) for nodes that are missing it."""
+    def enrich_nodes(
+        self,
+        nodes: list[dict],
+        credential_overrides: dict[str, dict[str, str]] | None = None,
+    ) -> list[dict]:
+        """Inject data.node (full Langflow component schema) and apply credential overrides."""
         schemas = self._fetch_component_schemas()
         enriched = []
         for node in nodes:
@@ -79,13 +104,49 @@ class LangflowMCPClient:
             node_type = node.get("type") or node.get("data", {}).get("type", "")
             data = dict(node.get("data", {}))
             if "node" not in data and node_type in schemas:
-                data["node"] = schemas[node_type]
+                data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy
+            # Inject credentials into template fields
+            if credential_overrides and node_type in credential_overrides and "node" in data:
+                tmpl = data["node"].get("template", {})
+                for field_name, value in credential_overrides[node_type].items():
+                    if field_name in tmpl:
+                        tmpl[field_name]["value"] = value
             # Ensure data.type and data.id are always set
             data.setdefault("type", node_type)
             data.setdefault("id", node.get("id", ""))
             node["data"] = data
             enriched.append(node)
         return enriched
+
+    def test_run_flow(self, flow_id: str, input_value: str = "2+2") -> dict:
+        """POST to /api/v1/run/{flow_id} with dummy input. Returns {ok, answer, error}."""
+        url = f"{self._langflow_base_url}/api/v1/run/{flow_id}"
+        payload = json.dumps({
+            "input_value": input_value,
+            "input_type": "chat",
+            "output_type": "chat",
+        }).encode()
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"x-api-key": self._langflow_api_key, "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+            text = _extract_text(result)
+            return {"ok": True, "answer": text or "(no text output)", "error": ""}
+        except Exception as e:
+            # Try to extract error detail from HTTP response body
+            error_str = str(e)
+            if hasattr(e, "read"):
+                try:
+                    body = json.loads(e.read())
+                    error_str = body.get("detail", error_str)
+                    if isinstance(error_str, str) and len(error_str) > 300:
+                        error_str = error_str[:300]
+                except Exception:
+                    pass
+            return {"ok": False, "answer": "", "error": error_str}
 
     def get_tool_schemas(self) -> list[dict]:
         return [

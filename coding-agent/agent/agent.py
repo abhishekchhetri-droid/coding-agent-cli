@@ -11,8 +11,12 @@ from agent.prompts import SYSTEM_PROMPT
 console = Console()
 
 
-def _inject_node_check(get_flow_result: str | None) -> str:
-    """Append a hard verification note when a post-build get_flow returns 0 nodes."""
+def _inject_node_check(
+    get_flow_result: str | None,
+    mcp: "LangflowMCPClient",
+    flow_id: str,
+) -> str:
+    """Check node count and test-run the flow. Append VERIFIED or FAILED to the tool result."""
     if not get_flow_result:
         return get_flow_result or "null"
     try:
@@ -26,6 +30,22 @@ def _inject_node_check(get_flow_result: str | None) -> str:
                 "Call list_components again, read the exact 'type' field values from the response, "
                 "write them out explicitly, then retry update_flow with ONLY those type strings. "
                 "Do NOT report success until node count > 0."
+            )
+        # Nodes exist — test-run the flow to confirm it actually executes
+        test = mcp.test_run_flow(flow_id)
+        if test["ok"]:
+            return (
+                get_flow_result
+                + f"\n\n✅ VERIFIED: Flow executed successfully. "
+                f"Test input '2+2' → '{test['answer']}'. "
+                f"Flow has {len(nodes)} nodes and is working. You may report success."
+            )
+        else:
+            return (
+                get_flow_result
+                + f"\n\n⚠ EXECUTION FAILED: Flow has {len(nodes)} nodes but failed to run: "
+                f"{test['error']}. "
+                "Do NOT report success. Fix the flow (check credentials, edge wiring, component config) and retry."
             )
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -112,14 +132,22 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 for tc in response["tool_calls"]:
                     args = tc["arguments"]
 
-                    # Auto-enrich nodes with full component schemas before sending to Langflow
+                    # Auto-enrich nodes with full component schemas + credentials before sending to Langflow
                     if tc["name"] in ("update_flow", "create_flow"):
                         data = args.get("data", {})
                         if isinstance(data, dict) and "nodes" in data:
                             try:
-                                data["nodes"] = mcp.enrich_nodes(data["nodes"])
+                                credential_overrides: dict = {}
+                                if settings.azure_openai_endpoint:
+                                    credential_overrides["AzureOpenAIModel"] = {
+                                        "azure_endpoint": settings.azure_openai_endpoint,
+                                        "api_key": settings.azure_openai_api_key,
+                                        "azure_deployment": settings.azure_openai_deployment,
+                                        "api_version": settings.azure_openai_api_version,
+                                    }
+                                data["nodes"] = mcp.enrich_nodes(data["nodes"], credential_overrides=credential_overrides)
                                 args = {**args, "data": data}
-                                console.print("[dim]↳ enriched nodes with component schemas[/dim]")
+                                console.print("[dim]↳ enriched nodes with component schemas + credentials[/dim]")
                             except Exception as enrich_err:
                                 console.print(f"[yellow]⚠ schema enrichment failed: {enrich_err}[/yellow]")
 
@@ -131,9 +159,10 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     if tc["name"] == "build_flow":
                         _last_build_flow_id = tc["arguments"].get("flow_id")
 
-                    # After get_flow following a build: enforce node count check
+                    # After get_flow following a build: check nodes + test-run
                     if tc["name"] == "get_flow" and _last_build_flow_id:
-                        result = _inject_node_check(result)
+                        console.print("[dim]↳ verifying flow execution…[/dim]")
+                        result = _inject_node_check(result, mcp, _last_build_flow_id)
                         _last_build_flow_id = None
 
                     messages.append(_tool_result_message(tc["id"], str(result)))

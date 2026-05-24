@@ -26,9 +26,11 @@ Full edge:
 ### Verify After Every Create/Update
 After create_flow or update_flow:
 1. Call build_flow with the returned flow ID
-2. Call get_flow — count BOTH nodes and edges in the result
-3. If node count is 0, the node type names were wrong. Go back to list_components, get exact type strings, retry update_flow.
-4. If edge count does not match what you sent, call update_flow with corrected edges and re-verify
+2. Call get_flow — the agent layer will automatically test-run the flow and append the result
+3. If you see "✅ VERIFIED: Flow executed successfully" — the flow works. Report success.
+4. If you see "⚠ VERIFICATION FAILED: 0 nodes" — node types were wrong. Re-discover and retry.
+5. If you see "⚠ EXECUTION FAILED" — nodes exist but flow errors. Read the error, fix the issue (credentials, edge wiring, component config), update_flow, rebuild, re-verify.
+6. NEVER report success without seeing ✅ VERIFIED in the get_flow result.
 
 ### Pagination
 Always pass page and limit to list_flows, list_folders, and any list tool. Never assume one page returns all results.
