@@ -11,6 +11,23 @@ from agent.prompts import SYSTEM_PROMPT
 console = Console()
 
 
+def _serialize_edge_handles(edges: list[dict]) -> list[dict]:
+    """Serialize sourceHandle/targetHandle as JSON strings and ensure each edge has an id.
+    React-flow requires handle identifiers to be strings, not objects.
+    """
+    result = []
+    for i, edge in enumerate(edges):
+        edge = dict(edge)
+        if isinstance(edge.get("sourceHandle"), dict):
+            edge["sourceHandle"] = json.dumps(edge["sourceHandle"])
+        if isinstance(edge.get("targetHandle"), dict):
+            edge["targetHandle"] = json.dumps(edge["targetHandle"])
+        if "id" not in edge:
+            edge["id"] = f"{edge.get('source', 'src')}-{edge.get('target', 'tgt')}-{i}"
+        result.append(edge)
+    return result
+
+
 def _inject_node_check(
     get_flow_result: str | None,
     mcp: "LangflowMCPClient",
@@ -146,6 +163,8 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                         "api_version": settings.azure_openai_api_version,
                                     }
                                 data["nodes"] = mcp.enrich_nodes(data["nodes"], credential_overrides=credential_overrides)
+                                if "edges" in data:
+                                    data["edges"] = _serialize_edge_handles(data["edges"])
                                 args = {**args, "data": data}
                                 console.print("[dim]↳ enriched nodes with component schemas + credentials[/dim]")
                             except Exception as enrich_err:
