@@ -115,6 +115,9 @@ class LangflowMCPClient:
             data.setdefault("type", node_type)
             data.setdefault("id", node.get("id", ""))
             node["data"] = data
+            # React-flow requires type="genericNode" for Langflow's custom node renderer.
+            # The component type lives in data.type; top-level type is only for the canvas.
+            node["type"] = "genericNode"
             enriched.append(node)
         return enriched
 
@@ -133,6 +136,9 @@ class LangflowMCPClient:
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 result = json.loads(resp.read())
+            # An empty outputs list means flow has no ChatOutput node — treat as failure
+            if not result.get("outputs"):
+                return {"ok": False, "answer": "", "error": "Flow returned empty outputs — missing ChatOutput node or flow is empty"}
             text = _extract_text(result)
             return {"ok": True, "answer": text or "(no text output)", "error": ""}
         except Exception as e:
