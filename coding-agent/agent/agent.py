@@ -164,7 +164,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     }
                                 data["nodes"] = mcp.enrich_nodes(data["nodes"], credential_overrides=credential_overrides)
                                 if "edges" in data:
-                                    data["edges"] = _serialize_edge_handles(data["edges"])
+                                    data["edges"] = mcp.enrich_edges(data["edges"], data["nodes"])
                                 args = {**args, "data": data}
                                 console.print("[dim]↳ enriched nodes with component schemas + credentials[/dim]")
                             except Exception as enrich_err:

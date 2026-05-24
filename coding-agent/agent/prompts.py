@@ -79,15 +79,33 @@ Always check actual output/input names from list_components before wiring:
 |-----------|------------|-----------|
 | ChatInput | `message` (Message) | — |
 | ChatOutput | — | `input_value` (Message) |
-| ToolCallingAgent | `response` (Message) | `input_value` (Message), `model` (LanguageModel), `tools` (Tool) |
+| ToolCallingAgent | `response` (Message) | `input_value` (str/Message), `model` (model/LanguageModel), `tools` (other/Tool) |
 | AzureOpenAIModel | `model_output` (LanguageModel) | `azure_endpoint`, `api_key`, `azure_deployment`, `api_version` |
 | CalculatorTool | `api_build_tool` (Tool) | `expression` |
 
-**Tool wiring direction**: Tools (CalculatorTool, PythonREPLTool, etc.) wire INTO the agent's `tools` input, not the other way.
-`CalculatorTool.api_build_tool → ToolCallingAgent.tools`
+**Tool wiring direction**: Tools (CalculatorTool, PythonREPLTool, etc.) wire INTO the agent's `tools` input (type=`other`), not the other way.
+`CalculatorTool.api_build_tool → ToolCallingAgent.tools`  (targetHandle type=`other`)
 
-**LLM wiring**: The LLM model output wires to the agent's `model` input.
-`AzureOpenAIModel.model_output → ToolCallingAgent.model`
+**LLM wiring**: The LLM model output wires to the agent's `model` input (type=`model`).
+`AzureOpenAIModel.model_output → ToolCallingAgent.model`  (targetHandle type=`model`)
+
+**Concrete example — 4 correct edges for calculator agent:**
+```json
+[
+  {"source":"ci","target":"agent",
+   "sourceHandle":{"dataType":"ChatInput","id":"ci","name":"message","output_types":["Message"]},
+   "targetHandle":{"fieldName":"input_value","id":"agent","inputTypes":["Message"],"type":"str"}},
+  {"source":"az","target":"agent",
+   "sourceHandle":{"dataType":"AzureOpenAIModel","id":"az","name":"model_output","output_types":["LanguageModel"]},
+   "targetHandle":{"fieldName":"model","id":"agent","inputTypes":["LanguageModel"],"type":"model"}},
+  {"source":"calc","target":"agent",
+   "sourceHandle":{"dataType":"CalculatorTool","id":"calc","name":"api_build_tool","output_types":["Tool"]},
+   "targetHandle":{"fieldName":"tools","id":"agent","inputTypes":["Tool"],"type":"other"}},
+  {"source":"agent","target":"co",
+   "sourceHandle":{"dataType":"ToolCallingAgent","id":"agent","name":"response","output_types":["Message"]},
+   "targetHandle":{"fieldName":"input_value","id":"co","inputTypes":["Message"],"type":"str"}}
+]
+```
 
 The agent layer injects full component schemas automatically — just provide correct type, id, and position in nodes.
 

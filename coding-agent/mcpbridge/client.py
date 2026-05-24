@@ -121,6 +121,60 @@ class LangflowMCPClient:
             enriched.append(node)
         return enriched
 
+    def enrich_edges(self, edges: list[dict], nodes: list[dict]) -> list[dict]:
+        """Serialize edge handles as JSON strings, add IDs, and fix targetHandle.type
+        by looking up the actual field type from the component schema.
+        React-flow requires handles to be JSON strings; wrong type causes edge rejection.
+        """
+        schemas = self._fetch_component_schemas()
+        # Build node_id → component_type map from the (already enriched) nodes
+        node_type_map: dict[str, str] = {}
+        for node in nodes:
+            nid = node.get("id", "")
+            comp_type = node.get("data", {}).get("type") or node.get("type", "")
+            if nid and comp_type and comp_type != "genericNode":
+                node_type_map[nid] = comp_type
+
+        result = []
+        for i, edge in enumerate(edges):
+            edge = dict(edge)
+            sh = edge.get("sourceHandle", {})
+            th = edge.get("targetHandle", {})
+
+            # Fix targetHandle.type from schema
+            if isinstance(th, dict):
+                th = dict(th)
+                tgt_node_id = edge.get("target", "")
+                tgt_comp_type = node_type_map.get(tgt_node_id, "")
+                field_name = th.get("fieldName", "")
+                if tgt_comp_type and field_name and tgt_comp_type in schemas:
+                    tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
+                    actual_type = tmpl_field.get("type")
+                    if actual_type:
+                        th["type"] = actual_type
+
+            # Serialize handles using Langflow's œ-encoding (frontend np() function:
+            # JSON.stringify(obj).replace(/"/g, "œ")) — sun() validation requires this format.
+            if isinstance(sh, dict):
+                edge["sourceHandle"] = json.dumps(sh).replace('"', 'œ')
+            if isinstance(th, dict):
+                edge["targetHandle"] = json.dumps(th).replace('"', 'œ')
+
+            # Ensure unique edge ID
+            if "id" not in edge:
+                edge["id"] = f"{edge.get('source', 'src')}-{edge.get('target', 'tgt')}-{i}"
+
+            # Keep parsed handles in data for Langflow backend
+            data = dict(edge.get("data", {}))
+            if isinstance(sh, dict):
+                data.setdefault("sourceHandle", sh)
+            if isinstance(th, dict):
+                data.setdefault("targetHandle", th)
+            edge["data"] = data
+
+            result.append(edge)
+        return result
+
     def test_run_flow(self, flow_id: str, input_value: str = "2+2") -> dict:
         """POST to /api/v1/run/{flow_id} with dummy input. Returns {ok, answer, error}."""
         url = f"{self._langflow_base_url}/api/v1/run/{flow_id}"
