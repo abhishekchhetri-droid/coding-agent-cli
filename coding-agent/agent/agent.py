@@ -33,36 +33,58 @@ def _inject_node_check(
     mcp: "LangflowMCPClient",
     flow_id: str,
 ) -> str:
-    """Check node count and test-run the flow. Append VERIFIED or FAILED to the tool result."""
+    """Check node/edge count and test-run the flow. Append VERIFIED or FAILED to the tool result."""
     if not get_flow_result:
         return get_flow_result or "null"
     try:
         data = json.loads(get_flow_result)
-        nodes = data.get("data", {}).get("nodes", []) if isinstance(data, dict) else []
-        if len(nodes) == 0:
+        flow_data = data.get("data", {}) if isinstance(data, dict) else {}
+        nodes = flow_data.get("nodes", [])
+        edges = flow_data.get("edges", [])
+        n_nodes = len(nodes)
+        n_edges = len(edges)
+
+        if n_nodes == 0:
             return (
                 get_flow_result
                 + "\n\n⚠ VERIFICATION FAILED: 0 nodes in flow after build. "
                 "All your node type strings were rejected by Langflow. "
-                "Call list_components again, read the exact 'type' field values from the response, "
-                "write them out explicitly, then retry update_flow with ONLY those type strings. "
+                "Call list_components, read exact 'type' field values, retry update_flow. "
                 "Do NOT report success until node count > 0."
             )
-        # Nodes exist — test-run the flow to confirm it actually executes
+
+        # Detect silently-dropped edges (Langflow removes invalid connections without error)
+        edge_warning = ""
+        min_expected = n_nodes - 1
+        if n_nodes > 4 and n_edges < min_expected:
+            edge_warning = (
+                f"\n\n⚠ EDGE WARNING: {n_nodes} nodes but only {n_edges} edges "
+                f"(expected ≥{min_expected}). Langflow removed invalid connections. "
+                "Call get_component_schema for each non-core component, verify fieldNames "
+                "and output names, then update_flow with corrected edges. Do NOT report "
+                "success — the flow is partially wired."
+            )
+
+        # Test-run to confirm execution
         test = mcp.test_run_flow(flow_id)
         if test["ok"]:
-            return (
-                get_flow_result
-                + f"\n\n✅ VERIFIED: Flow executed successfully. "
+            suffix = (
+                f"\n\n✅ VERIFIED: Flow executed successfully. "
                 f"Test input '2+2' → '{test['answer']}'. "
-                f"Flow has {len(nodes)} nodes and is working. You may report success."
+                f"Flow has {n_nodes} nodes, {n_edges} edges."
             )
+            if edge_warning:
+                suffix += " However, edge count is low — fix wiring before reporting success."
+            else:
+                suffix += " You may report success."
+            return get_flow_result + edge_warning + suffix
         else:
             return (
                 get_flow_result
-                + f"\n\n⚠ EXECUTION FAILED: Flow has {len(nodes)} nodes but failed to run: "
+                + edge_warning
+                + f"\n\n⚠ EXECUTION FAILED: Flow has {n_nodes} nodes but failed to run: "
                 f"{test['error']}. "
-                "Do NOT report success. Fix the flow (check credentials, edge wiring, component config) and retry."
+                "Do NOT report success. Fix credentials/wiring/config and retry."
             )
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -77,6 +99,20 @@ def _tool_result_message(tool_call_id: str, result: str | None) -> dict:
     }
 
 
+def _compact_tool_args(tc: dict) -> dict:
+    """Strip large data payloads from create/update tool calls before storing in history.
+    These calls carry full node schemas (~5K tokens each) that repeat in every LLM call."""
+    if tc["name"] in ("create_flow", "update_flow"):
+        args = dict(tc["arguments"])
+        if isinstance(args.get("data"), dict):
+            d = args["data"]
+            n = len(d.get("nodes", []))
+            e = len(d.get("edges", []))
+            args["data"] = f"<{n} nodes, {e} edges — payload stripped>"
+        return args
+    return tc["arguments"]
+
+
 def _assistant_tool_call_message(tool_calls: list[dict]) -> dict:
     return {
         "role": "assistant",
@@ -87,7 +123,7 @@ def _assistant_tool_call_message(tool_calls: list[dict]) -> dict:
                 "type": "function",
                 "function": {
                     "name": tc["name"],
-                    "arguments": json.dumps(tc["arguments"]),
+                    "arguments": json.dumps(_compact_tool_args(tc)),
                 },
             }
             for tc in tool_calls
@@ -150,11 +186,21 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     args = tc["arguments"]
 
                     # Auto-enrich nodes with full component schemas + credentials before sending to Langflow
+                    enrich_error: str | None = None
                     if tc["name"] in ("update_flow", "create_flow"):
                         data = args.get("data", {})
                         if isinstance(data, dict) and "nodes" in data:
                             try:
                                 credential_overrides: dict = {}
+                                if settings.azure_anthropic_api_key:
+                                    credential_overrides["AnthropicModel"] = {
+                                        "api_key": settings.azure_anthropic_api_key,
+                                        "base_url": settings.azure_anthropic_endpoint,
+                                        "model_name": settings.azure_anthropic_deployment,
+                                    }
+                                    credential_overrides["Agent"] = {
+                                        "api_key": settings.azure_anthropic_api_key,
+                                    }
                                 if settings.azure_openai_endpoint:
                                     credential_overrides["AzureOpenAIModel"] = {
                                         "azure_endpoint": settings.azure_openai_endpoint,
@@ -168,17 +214,62 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 args = {**args, "data": data}
                                 console.print("[dim]↳ enriched nodes with component schemas + credentials[/dim]")
                             except Exception as enrich_err:
-                                console.print(f"[yellow]⚠ schema enrichment failed: {enrich_err}[/yellow]")
+                                enrich_error = str(enrich_err)
+                                console.print(f"[red]✗ schema enrichment failed: {enrich_err}[/red]")
+                                console.print("[dim]↳ skipping call to prevent broken flow[/dim]")
 
-                    try:
-                        result = await mcp.call_tool(tc["name"], args)
-                    except Exception as e:
-                        result = f"ERROR: {e}"
+                    if enrich_error:
+                        # Refuse to send broken nodes to Langflow. Return error as tool result so LLM retries.
+                        result = f"ERROR: {enrich_error} Do NOT retry blindly — call list_components first and find the exact 'type' string."
+                    elif tc["name"] == "get_component_schema":
+                        # Virtual tool — handled locally, no MCP call needed
+                        result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
+                    else:
+                        try:
+                            result = await mcp.call_tool(tc["name"], args)
+                        except Exception as e:
+                            result = f"ERROR: {e}"
 
                     if tc["name"] == "build_flow":
                         _last_build_flow_id = tc["arguments"].get("flow_id")
+                        # build_flow result is large job metadata — LLM only needs the job_id
+                        try:
+                            bdata = json.loads(result) if isinstance(result, str) else result
+                            if isinstance(bdata, dict) and "id" in bdata:
+                                result = json.dumps({"id": bdata["id"], "status": bdata.get("status", "")})
+                        except Exception:
+                            pass
 
-                    # After get_flow following a build: check nodes + test-run
+                    # Strip list_components to type+display_name only — full schema is ~1M tokens
+                    if tc["name"] == "list_components":
+                        try:
+                            components = json.loads(result) if isinstance(result, str) else result
+                            if isinstance(components, list):
+                                result = json.dumps([
+                                    {"type": c.get("type"), "display_name": c.get("display_name", c.get("type"))}
+                                    for c in components
+                                ])
+                        except Exception:
+                            pass
+
+                    # Strip data.node schemas from any tool that returns flow JSON.
+                    # create_flow/update_flow return the full updated flow — same schema bloat as get_flow.
+                    # Must run before _inject_node_check (which appends text and breaks JSON parsing).
+                    if tc["name"] in ("get_flow", "create_flow", "update_flow"):
+                        try:
+                            flow = json.loads(result) if isinstance(result, str) else result
+                            if isinstance(flow, dict) and "data" in flow:
+                                for node in flow.get("data", {}).get("nodes", []):
+                                    node.get("data", {}).pop("node", None)
+                                result = json.dumps({
+                                    "id": flow.get("id"),
+                                    "name": flow.get("name"),
+                                    "data": flow.get("data"),
+                                })
+                        except Exception:
+                            pass
+
+                    # After get_flow following a build: check nodes + test-run (runs after truncation)
                     if tc["name"] == "get_flow" and _last_build_flow_id:
                         console.print("[dim]↳ verifying flow execution…[/dim]")
                         result = _inject_node_check(result, mcp, _last_build_flow_id)
@@ -195,6 +286,10 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     console.print(
                         f"[dim]↑{prompt_tokens:,} ↓{completion_tokens:,} tokens[/dim]"
                     )
+                # Trim history to last 2 user turns + this assistant response.
+                # Drops tool call/result messages from prior turns to prevent token explosion.
+                prior_user = [m for m in messages if m["role"] == "user"]
+                messages = prior_user[-2:] + [{"role": "assistant", "content": response["content"]}]
                 break
         else:
             console.print("[yellow]⚠ Max tool iterations reached.[/yellow]")

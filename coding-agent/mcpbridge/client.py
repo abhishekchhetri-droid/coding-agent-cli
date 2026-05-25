@@ -101,25 +101,58 @@ class LangflowMCPClient:
         enriched = []
         for node in nodes:
             node = dict(node)
-            node_type = node.get("type") or node.get("data", {}).get("type", "")
+            # Prefer data.type — top-level type is "genericNode" for canvas-rendered nodes
+            node_type = node.get("data", {}).get("type") or node.get("type", "")
             data = dict(node.get("data", {}))
-            if "node" not in data and node_type in schemas:
+            if "node" not in data:
+                if node_type not in schemas:
+                    raise ValueError(
+                        f"Unknown component type: {node_type!r}. "
+                        f"Call list_components to find the exact 'type' string, then retry."
+                    )
                 data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy
             # Inject credentials into template fields
             if credential_overrides and node_type in credential_overrides and "node" in data:
                 tmpl = data["node"].get("template", {})
                 for field_name, value in credential_overrides[node_type].items():
-                    if field_name in tmpl:
-                        tmpl[field_name]["value"] = value
+                    # /api/v1/all omits SecretStrInput fields from schema — create entry if missing
+                    if field_name not in tmpl:
+                        tmpl[field_name] = {"name": field_name, "type": "str", "value": ""}
+                    tmpl[field_name]["value"] = value
             # Ensure data.type and data.id are always set
             data.setdefault("type", node_type)
             data.setdefault("id", node.get("id", ""))
+            # For nodes with multiple outputs, pin the correct active output so the
+            # canvas connects the right handle (e.g. model_output not text_output).
+            _SELECTED_OUTPUTS = {"AzureOpenAIModel": "model_output", "AnthropicModel": "model_output"}
+            if node_type in _SELECTED_OUTPUTS:
+                data.setdefault("selected_output", _SELECTED_OUTPUTS[node_type])
             node["data"] = data
             # React-flow requires type="genericNode" for Langflow's custom node renderer.
             # The component type lives in data.type; top-level type is only for the canvas.
             node["type"] = "genericNode"
             enriched.append(node)
+        # Auto-enable tool_mode for non-native-tool nodes feeding Agent.tools
+        self._auto_tool_mode(enriched)
         return enriched
+
+    def _auto_tool_mode(self, nodes: list[dict]) -> None:
+        """Enable tool_mode on non-native-tool nodes that expose a tool-eligible output.
+        Skips tool CONSUMERS (nodes with a 'tools' input, e.g. Agent) — they must never
+        have tool_mode enabled or their Toolset handle renders instead of the tools input."""
+        for node in nodes:
+            d = node.get("data", {})
+            schema = d.get("node", {})
+            if not schema:
+                continue
+            # Skip tool consumers — enabling tool_mode on them breaks their tools input handle
+            if "tools" in schema.get("template", {}):
+                continue
+            outputs = schema.get("outputs", [])
+            has_native_tool = any(o.get("name") == "api_build_tool" for o in outputs)
+            has_tool_eligible = any(o.get("tool_mode") for o in outputs)
+            if not has_native_tool and has_tool_eligible:
+                schema["tool_mode"] = True
 
     def enrich_edges(self, edges: list[dict], nodes: list[dict]) -> list[dict]:
         """Serialize edge handles as JSON strings, add IDs, and fix targetHandle.type
@@ -134,6 +167,9 @@ class LangflowMCPClient:
             comp_type = node.get("data", {}).get("type") or node.get("type", "")
             if nid and comp_type and comp_type != "genericNode":
                 node_type_map[nid] = comp_type
+
+        # Build node_id → enriched node (so we can read its outputs for tool-mode rewriting)
+        node_by_id = {n.get("id", ""): n for n in nodes}
 
         result = []
         for i, edge in enumerate(edges):
@@ -152,6 +188,29 @@ class LangflowMCPClient:
                     actual_type = tmpl_field.get("type")
                     if actual_type:
                         th["type"] = actual_type
+
+            # Rewrite sourceHandle for tool-mode connections to Agent.tools
+            if (
+                isinstance(sh, dict)
+                and isinstance(th, dict)
+                and th.get("fieldName") == "tools"
+                and sh.get("name") in (None, "", "api_build_tool")
+            ):
+                src_node = node_by_id.get(edge.get("source", ""))
+                if src_node:
+                    src_schema = src_node.get("data", {}).get("node", {})
+                    if src_schema.get("tool_mode"):
+                        outputs = src_schema.get("outputs", [])
+                        # Prefer an output explicitly flagged tool_mode=True;
+                        # fall back to first output (Langflow wraps it as Tool when tool_mode is on).
+                        tool_out = next(
+                            (o for o in outputs if o.get("tool_mode")),
+                            outputs[0] if outputs else None,
+                        )
+                        if tool_out:
+                            sh = dict(sh)
+                            sh["name"] = tool_out.get("name", sh.get("name", ""))
+                            sh["output_types"] = ["Tool"]
 
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
             # JSON.stringify(obj).replace(/"/g, "œ")) — sun() validation requires this format.
@@ -208,6 +267,68 @@ class LangflowMCPClient:
                     pass
             return {"ok": False, "answer": "", "error": error_str}
 
+    _CORE_TOOLS = {
+        "create_flow", "update_flow", "get_flow", "list_flows", "delete_flow",
+        "build_flow", "get_build_status", "run_flow",
+        "list_components", "list_variables", "list_folders",
+        "get_basic_examples", "list_starter_projects", "health_check",
+    }
+
+    _VIRTUAL_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_component_schema",
+                "description": (
+                    "Get exact input field names and output handle names for a specific component type. "
+                    "Call this for ANY component not listed in the system prompt's Component Reference table "
+                    "before building edges to/from it. Prevents invalid connections."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "type_name": {
+                            "type": "string",
+                            "description": "Exact component type string (e.g. 'SplitText', 'Chroma', 'AzureOpenAIEmbeddings')"
+                        }
+                    },
+                    "required": ["type_name"],
+                },
+            },
+        }
+    ]
+
+    def get_component_schema(self, type_name: str) -> dict:
+        """Return compact schema (inputs + outputs) for one component. Uses cached /api/v1/all data."""
+        schemas = self._fetch_component_schemas()
+        if type_name not in schemas:
+            return {"error": f"Unknown type: {type_name!r}. Call list_components to find the exact type string."}
+        schema = schemas[type_name]
+        tmpl = schema.get("template", {})
+        outputs = schema.get("outputs", [])
+        inputs = [
+            {
+                "field": k,
+                "type": v.get("type", ""),
+                "display": v.get("display_name", k),
+                "required": v.get("required", False),
+                "input_types": v.get("input_types", []),
+            }
+            for k, v in tmpl.items()
+            if isinstance(v, dict)
+            and not v.get("advanced", False) and v.get("show", True)
+            and v.get("type") not in ("code", "prompt")
+        ]
+        outs = [
+            {
+                "name": o.get("name"),
+                "types": o.get("output_types", []),
+                "tool_mode": o.get("tool_mode", False),
+            }
+            for o in outputs
+        ]
+        return {"type": type_name, "inputs": inputs, "outputs": outs}
+
     def get_tool_schemas(self) -> list[dict]:
         return [
             {
@@ -219,7 +340,8 @@ class LangflowMCPClient:
                 },
             }
             for t in self._tools_cache
-        ]
+            if t.name in self._CORE_TOOLS
+        ] + self._VIRTUAL_TOOLS
 
     async def call_tool(self, name: str, arguments: dict) -> Any:
         if self._session is None:

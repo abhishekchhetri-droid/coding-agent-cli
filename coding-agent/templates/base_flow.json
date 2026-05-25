@@ -1,0 +1,48 @@
+{
+  "nodes": [
+    {
+      "id": "ChatInput-1",
+      "type": "ChatInput",
+      "position": {"x": -150, "y": 250},
+      "data": {"type": "ChatInput", "id": "ChatInput-1"}
+    },
+    {
+      "id": "AzureOpenAIModel-1",
+      "type": "AzureOpenAIModel",
+      "position": {"x": 250, "y": 200},
+      "data": {"type": "AzureOpenAIModel", "id": "AzureOpenAIModel-1"}
+    },
+    {
+      "id": "Agent-1",
+      "type": "Agent",
+      "position": {"x": 670, "y": 540},
+      "data": {"type": "Agent", "id": "Agent-1"}
+    },
+    {
+      "id": "ChatOutput-1",
+      "type": "ChatOutput",
+      "position": {"x": 1050, "y": 300},
+      "data": {"type": "ChatOutput", "id": "ChatOutput-1"}
+    }
+  ],
+  "edges": [
+    {
+      "source": "ChatInput-1",
+      "sourceHandle": {"dataType": "ChatInput", "id": "ChatInput-1", "name": "message", "output_types": ["Message"]},
+      "target": "AzureOpenAIModel-1",
+      "targetHandle": {"fieldName": "input_value", "id": "AzureOpenAIModel-1", "inputTypes": ["Message"], "type": "str"}
+    },
+    {
+      "source": "AzureOpenAIModel-1",
+      "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+      "target": "Agent-1",
+      "targetHandle": {"fieldName": "model", "id": "Agent-1", "inputTypes": ["LanguageModel"], "type": "model"}
+    },
+    {
+      "source": "Agent-1",
+      "sourceHandle": {"dataType": "Agent", "id": "Agent-1", "name": "response", "output_types": ["Message"]},
+      "target": "ChatOutput-1",
+      "targetHandle": {"fieldName": "input_value", "id": "ChatOutput-1", "inputTypes": ["Data", "JSON", "DataFrame", "Table", "Message"], "type": "other"}
+    }
+  ]
+}
