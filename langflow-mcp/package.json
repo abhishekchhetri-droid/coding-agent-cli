@@ -1,0 +1,81 @@
+{
+  "name": "langflow-mcp-server",
+  "version": "3.1.1",
+  "description": "Integration for Langflow API 1.7.2 via Model Context Protocol (MCP)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "langflow-mcp-server": "./dist/mcp/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/mcp/index.js",
+    "start:http": "MCP_MODE=http node dist/mcp/index.js",
+    "dev": "npm run build && npm run start",
+    "dev:http": "MCP_MODE=http nodemon --watch src --ext ts --exec 'npm run build && npm run start:http'",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nobrainer-tech/langflow-mcp.git"
+  },
+  "keywords": [
+    "langflow",
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "ai",
+    "workflow",
+    "automation",
+    "langflow-api",
+    "claude",
+    "ai-tools",
+    "llm",
+    "rag",
+    "knowledge-base",
+    "flow-automation"
+  ],
+  "author": "nobrainer-tech",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/nobrainer-tech/langflow-mcp/issues"
+  },
+  "homepage": "https://github.com/nobrainer-tech/langflow-mcp#readme",
+  "files": [
+    "dist/**/*",
+    ".env.example",
+    "healthcheck.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "@vitest/coverage-v8": "^4.0.3",
+    "@vitest/ui": "^4.0.3",
+    "axios-mock-adapter": "^2.1.0",
+    "nodemon": "^3.1.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3",
+    "vitest": "^4.0.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.2",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.3",
+    "form-data": "^4.0.4",
+    "zod": "^4.1.12"
+  }
+}
