@@ -1,11 +1,11 @@
 from .base import LLMProvider
 from .azure_openai import AzureOpenAIProvider
+from .azure_anthropic import AzureAnthropicProvider
 from config.settings import Settings
 
 PROVIDERS: dict[str, type[LLMProvider]] = {
     "azure_openai": AzureOpenAIProvider,
-    # "anthropic": AnthropicProvider,
-    # "openai": OpenAIProvider,
+    "azure_anthropic": AzureAnthropicProvider,
 }
 
 

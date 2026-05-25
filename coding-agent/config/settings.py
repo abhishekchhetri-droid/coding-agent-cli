@@ -30,5 +30,10 @@ class Settings(BaseSettings):
     azure_openai_deployment: str = ""
     azure_openai_api_version: str = "2024-12-01-preview"
 
+    # Azure Anthropic (AnthropicFoundry)
+    azure_anthropic_endpoint: str = ""
+    azure_anthropic_api_key: str = ""
+    azure_anthropic_deployment: str = "claude-sonnet-4-6"
+
     # Agent behaviour
     max_tool_iterations: int = 10
