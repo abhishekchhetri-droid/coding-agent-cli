@@ -189,27 +189,24 @@ class LangflowMCPClient:
                 continue
             # Prefer data.type — top-level type is "genericNode" for canvas-rendered nodes
             raw_type = node.get("data", {}).get("type") or node.get("type", "")
+            # node_type resolves to the /api/v1/all schema key (used for schema lookup only)
             node_type = self._resolve_type(raw_type, schemas)
             data = dict(node.get("data", {}))
-            # Patch data.type to canonical resolved type so edges + credentials match correctly
-            if node_type != raw_type:
-                data["type"] = node_type
-                if isinstance(node.get("data"), dict):
-                    node = dict(node)
-            if "node" not in data:
-                if node_type not in schemas:
-                    raise ValueError(
-                        f"Unknown component type: {node_type!r}. "
-                        f"Call list_components to find the exact 'type' string, then retry."
-                    )
-                data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy
-            elif "_type" not in data["node"].get("template", {}):
-                # _type is required by Langflow's graph builder (_create_vertex line 2136).
-                # Template-copied data.node may lack it — inject from live schema if available.
-                schema_tmpl = schemas.get(node_type, {}).get("template", {})
-                if "_type" in schema_tmpl:
-                    data["node"].setdefault("template", {})["_type"] = schema_tmpl["_type"]
-            # Inject credentials into template fields
+            if node_type not in schemas:
+                raise ValueError(
+                    f"Unknown component type: {node_type!r}. "
+                    f"Call list_components to find the exact 'type' string, then retry."
+                )
+            # Always use the live schema — template-cloned nodes can carry stale data.node
+            # (missing display_name, empty outputs) which causes the Langflow frontend to show
+            # "undefined" for node names and drop all edges as invalid.
+            # data.type is preserved separately so the canvas renderer stays correct.
+            data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy of live schema
+            # Only patch data.type for fresh nodes — for template nodes data.type is already correct
+            if "node" not in node.get("data", {}):
+                if node_type != raw_type:
+                    data["type"] = node_type
+            # Inject credentials — uses node_type (schema key) to find the right overrides
             if credential_overrides and node_type in credential_overrides and "node" in data:
                 tmpl = data["node"].get("template", {})
                 for field_name, value in credential_overrides[node_type].items():
@@ -218,7 +215,7 @@ class LangflowMCPClient:
                         tmpl[field_name] = {"name": field_name, "type": "str", "value": ""}
                     tmpl[field_name]["value"] = value
             # Ensure data.type and data.id are always set
-            data.setdefault("type", node_type)
+            data.setdefault("type", raw_type)  # preserve original type if not already set
             data.setdefault("id", node.get("id", ""))
             # For nodes with multiple outputs, pin the correct active output so the
             # canvas connects the right handle (e.g. model_output not text_output).
