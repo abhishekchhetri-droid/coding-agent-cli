@@ -245,8 +245,18 @@ class LangflowMCPClient:
         and URLComponent declare tool_mode on their inputs — that is the canonical signal
         that the component supports being wrapped as a StructuredTool.
 
+        Only runs when an Agent node is present — without an Agent there is no consumer
+        for tool outputs, so enabling tool_mode would corrupt data-pipeline nodes (e.g.
+        AstraDB's search_results output gets overridden with component_as_tool).
+
         Skips tool CONSUMERS (nodes with a 'tools' input, e.g. Agent) and native tool
         nodes (already have api_build_tool output)."""
+        has_agent = any(
+            "tools" in n.get("data", {}).get("node", {}).get("template", {})
+            for n in nodes
+        )
+        if not has_agent:
+            return
         for node in nodes:
             d = node.get("data", {})
             schema = d.get("node", {})
@@ -357,15 +367,16 @@ class LangflowMCPClient:
     @staticmethod
     def _parse_handle(handle: Any) -> dict:
         """Normalize edge handles to dict.
-        Template-cloned edges store handles as JSON strings or œ-encoded strings.
+        Template-cloned edges store handles as JSON strings or Å/œ-encoded strings.
         LLM-generated edges use plain dicts. Normalize all to dict for uniform processing."""
         if isinstance(handle, dict):
             return handle
         if isinstance(handle, str):
-            try:
-                return json.loads(handle.replace('œ', '"'))
-            except Exception:
-                return {}
+            for char in ('œ', 'Å'):
+                try:
+                    return json.loads(handle.replace(char, '"'))
+                except Exception:
+                    continue
         return {}
 
     # Structural/base nodes that must never be used as tools.
