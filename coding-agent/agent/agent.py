@@ -289,12 +289,36 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                         for o in n.get("data", {}).get("node", {}).get("outputs", [])
                                     )
                                 llm_nodes = [n for n in data["nodes"] if _node_outputs_langmodel(n)]
-                                if len(llm_nodes) > 1:
-                                    preferred_llm = next(
-                                        (n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"),
-                                        llm_nodes[0],
+                                azure_llm = next((n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"), None)
+                                if not azure_llm:
+                                    # Remove any non-Azure LLM nodes (may be 0 or more)
+                                    if llm_nodes:
+                                        remove_ids = {n.get("id", "") for n in llm_nodes}
+                                        data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in remove_ids]
+                                        data["edges"] = [
+                                            e for e in data.get("edges", [])
+                                            if e.get("source") not in remove_ids and e.get("target") not in remove_ids
+                                        ]
+                                        for rid in remove_ids:
+                                            console.print(f"[yellow]↳ replaced non-Azure LLM '{rid}' with AzureOpenAIModel[/yellow]")
+                                    removed_pos = next(
+                                        (n.get("position", {"x": 250, "y": 200}) for n in llm_nodes),
+                                        {"x": 250, "y": 200},
                                     )
-                                    extra_llm_ids = {n.get("id", "") for n in llm_nodes if n is not preferred_llm}
+                                    azure_stub = [{"id": "AzureOpenAIModel-1", "type": "AzureOpenAIModel", "position": removed_pos, "data": {"type": "AzureOpenAIModel", "id": "AzureOpenAIModel-1"}}]
+                                    data["nodes"].extend(mcp.enrich_nodes(azure_stub, credential_overrides=credential_overrides))
+                                    agent_ns = [n for n in data["nodes"] if "model" in n.get("data", {}).get("node", {}).get("template", {})]
+                                    for agent_n in agent_ns:
+                                        if agent_n.get("data", {}).get("type") in ("Agent",):
+                                            data["edges"].append({
+                                                "source": "AzureOpenAIModel-1",
+                                                "target": agent_n.get("id"),
+                                                "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                                "targetHandle": {"fieldName": "model", "id": agent_n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
+                                            })
+                                    console.print("[dim]↳ injected AzureOpenAIModel → Agent.model[/dim]")
+                                elif len(llm_nodes) > 1:
+                                    extra_llm_ids = {n.get("id", "") for n in llm_nodes if n is not azure_llm}
                                     data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in extra_llm_ids]
                                     data["edges"] = [
                                         e for e in data.get("edges", [])
