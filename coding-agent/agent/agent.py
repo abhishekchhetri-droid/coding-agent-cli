@@ -217,6 +217,25 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                 messages.append(_assistant_tool_call_message(response["tool_calls"]))
 
+                # Build credential overrides once per turn — reused by create_flow, update_flow, clone_starter_template
+                _credential_overrides: dict = {}
+                if settings.azure_anthropic_api_key:
+                    _credential_overrides["AnthropicModel"] = {
+                        "api_key": settings.azure_anthropic_api_key,
+                        "base_url": settings.azure_anthropic_endpoint,
+                        "model_name": settings.azure_anthropic_deployment,
+                    }
+                    _credential_overrides["Agent"] = {
+                        "api_key": settings.azure_anthropic_api_key,
+                    }
+                if settings.azure_openai_endpoint:
+                    _credential_overrides["AzureOpenAIModel"] = {
+                        "azure_endpoint": settings.azure_openai_endpoint,
+                        "api_key": settings.azure_openai_api_key,
+                        "azure_deployment": settings.azure_openai_deployment,
+                        "api_version": settings.azure_openai_api_version,
+                    }
+
                 _last_build_flow_id: str | None = None
                 _starter_template_msg_ids: set[str] = set()
                 for tc in response["tool_calls"]:
@@ -228,23 +247,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         data = args.get("data", {})
                         if isinstance(data, dict) and "nodes" in data:
                             try:
-                                credential_overrides: dict = {}
-                                if settings.azure_anthropic_api_key:
-                                    credential_overrides["AnthropicModel"] = {
-                                        "api_key": settings.azure_anthropic_api_key,
-                                        "base_url": settings.azure_anthropic_endpoint,
-                                        "model_name": settings.azure_anthropic_deployment,
-                                    }
-                                    credential_overrides["Agent"] = {
-                                        "api_key": settings.azure_anthropic_api_key,
-                                    }
-                                if settings.azure_openai_endpoint:
-                                    credential_overrides["AzureOpenAIModel"] = {
-                                        "azure_endpoint": settings.azure_openai_endpoint,
-                                        "api_key": settings.azure_openai_api_key,
-                                        "azure_deployment": settings.azure_openai_deployment,
-                                        "api_version": settings.azure_openai_api_version,
-                                    }
+                                credential_overrides = _credential_overrides
                                 # Deduplicate structural singletons (non-LLM) by type name
                                 _STRUCTURAL_SINGLETONS = {"ChatInput", "ChatOutput", "Agent"}
                                 seen_singletons: set[str] = set()
@@ -309,6 +312,47 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         result = f"ERROR: {enrich_error} Do NOT retry blindly — call list_components first and find the exact 'type' string."
                     elif tc["name"] == "get_component_schema":
                         result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
+                    elif tc["name"] == "clone_starter_template":
+                        # Server-side clone: fetch template → enrich → POST directly, zero LLM token cost
+                        name_or_id = (args.get("name_or_id") or "").strip()
+                        flow_name = (args.get("name") or name_or_id).strip()
+                        flow_desc = args.get("description", "")
+                        key = name_or_id.lower()
+                        # Lookup chain: in-memory cache → Redis/HTTP via client
+                        template = _starter_cache.get(key)
+                        if not template:
+                            for k, v in _starter_cache.items():
+                                if key in k or k in key:
+                                    template = v
+                                    break
+                        if not template:
+                            template = await mcp.fetch_starter(name_or_id)
+                        if not template:
+                            result = json.dumps({"error": f"Template '{name_or_id}' not found. Call get_basic_examples to populate cache first."})
+                        else:
+                            try:
+                                tdata = json.loads(json.dumps(template.get("data", {})))  # deep copy
+                                if not tdata.get("nodes"):
+                                    result = json.dumps({"error": "Template has no nodes."})
+                                else:
+                                    tdata["nodes"] = mcp.enrich_nodes(tdata["nodes"], credential_overrides=_credential_overrides)
+                                    tdata["edges"] = mcp.ensure_tool_edges(tdata["nodes"], tdata.get("edges", []))
+                                    tdata["edges"] = mcp.enrich_edges(tdata["edges"], tdata["nodes"])
+                                    created = mcp._create_flow_direct(
+                                        name=flow_name or template.get("name", "Cloned Flow"),
+                                        description=flow_desc or template.get("description", ""),
+                                        data=tdata,
+                                    )
+                                    _last_build_flow_id = None  # reset; build_flow will set it
+                                    result = json.dumps({
+                                        "flow_id": created.get("id"),
+                                        "name": created.get("name"),
+                                        "node_count": len(tdata["nodes"]),
+                                        "edge_count": len(tdata["edges"]),
+                                    })
+                                    console.print(f"[dim]↳ cloned '{template.get('name')}' → {created.get('id')} ({len(tdata['nodes'])} nodes, {len(tdata['edges'])} edges)[/dim]")
+                            except Exception as clone_err:
+                                result = f"ERROR cloning template: {clone_err}"
                     elif tc["name"] == "get_starter_template":
                         # Virtual tool — look up cached starter data, return full template for ONE winner
                         key = (args.get("name_or_id") or "").strip().lower()
@@ -324,7 +368,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             _starter_template_msg_ids.add(tc["id"])
                             console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
                         else:
-                            result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call list_starter_projects first."})
+                            result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call get_basic_examples first."})
                     else:
                         try:
                             result = await mcp.call_tool(tc["name"], args)

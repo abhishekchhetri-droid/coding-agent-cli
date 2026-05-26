@@ -89,9 +89,12 @@ class LangflowMCPClient:
             try:
                 flows_raw = await self._session_call_json("list_flows", {})
                 starters_raw = await self._session_call_json("list_starter_projects", {})
+                # list_starter_projects returns empty on many Langflow instances — fall back to basic examples
+                if not starters_raw:
+                    starters_raw = await self._session_call_json("get_basic_examples", {})
                 if isinstance(flows_raw, list):
                     await self._redis_cache.sync_flows(flows_raw)
-                if isinstance(starters_raw, list):
+                if isinstance(starters_raw, list) and starters_raw:
                     await self._redis_cache.sync_starters(starters_raw)
                 self._sync_task = asyncio.create_task(self._background_sync())
             except Exception as e:
@@ -249,6 +252,24 @@ class LangflowMCPClient:
             if not has_native_tool and has_tool_eligible:
                 schema["tool_mode"] = True
 
+    @staticmethod
+    def _parse_handle(handle: Any) -> dict:
+        """Normalize edge handles to dict.
+        Template-cloned edges store handles as JSON strings or œ-encoded strings.
+        LLM-generated edges use plain dicts. Normalize all to dict for uniform processing."""
+        if isinstance(handle, dict):
+            return handle
+        if isinstance(handle, str):
+            try:
+                return json.loads(handle.replace('œ', '"'))
+            except Exception:
+                return {}
+        return {}
+
+    # Structural/base nodes that must never be used as tools.
+    # These are architectural invariants, not use-case hacks.
+    _NEVER_TOOL: set[str] = {"AzureOpenAIModel", "AnthropicModel", "ChatInput", "ChatOutput", "Agent"}
+
     def enrich_edges(self, edges: list[dict], nodes: list[dict]) -> list[dict]:
         """Serialize edge handles as JSON strings, add IDs, and fix targetHandle.type
         by looking up the actual field type from the component schema.
@@ -269,45 +290,59 @@ class LangflowMCPClient:
         result = []
         for i, edge in enumerate(edges):
             edge = dict(edge)
-            sh = edge.get("sourceHandle", {})
-            th = edge.get("targetHandle", {})
+            # Normalize handles to dicts regardless of source format.
+            # Template edges arrive as JSON strings; LLM edges as dicts.
+            sh = self._parse_handle(edge.get("sourceHandle", {}))
+            th = self._parse_handle(edge.get("targetHandle", {}))
 
             # Fix targetHandle.type from schema
-            if isinstance(th, dict):
-                th = dict(th)
-                tgt_node_id = edge.get("target", "")
-                tgt_comp_type = node_type_map.get(tgt_node_id, "")
-                field_name = th.get("fieldName", "")
-                if tgt_comp_type and field_name and tgt_comp_type in schemas:
-                    tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
-                    actual_type = tmpl_field.get("type")
-                    if actual_type:
-                        th["type"] = actual_type
+            th = dict(th)
+            tgt_node_id = edge.get("target", "")
+            tgt_comp_type = node_type_map.get(tgt_node_id, "")
+            field_name = th.get("fieldName", "")
+            if tgt_comp_type and field_name and tgt_comp_type in schemas:
+                tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
+                actual_type = tmpl_field.get("type")
+                if actual_type:
+                    th["type"] = actual_type
 
-            # Rewrite sourceHandle for tool-mode connections to Agent.tools.
-            # Always rewrite when target is tools input — regardless of sh["name"].
-            # The LLM may pass the original (non-tool-mode) output name from the template.
-            if isinstance(sh, dict) and isinstance(th, dict) and th.get("fieldName") == "tools":
+            # Rewrite sourceHandle for ALL tool edges (fieldName=="tools").
+            # Runs regardless of tool_mode state — template clones, LLM-created edges, native tools.
+            # Detection is fully schema-driven (no component name hardcoding):
+            #   priority 1: native api_build_tool output (CalculatorTool, SearchAPI, WikipediaAPI, ...)
+            #   priority 2: output with tool_mode:true in schema (URLComponent.page_results, ...)
+            #   priority 3: fallback — enable tool_mode, Langflow framework wraps primary output
+            # _NEVER_TOOL: structural nodes that must never be treated as tools; wrong edges from
+            # LLM hallucination are left unrewritten so Langflow drops them cleanly.
+            if th.get("fieldName") == "tools":
                 src_node = node_by_id.get(edge.get("source", ""))
                 if src_node:
+                    src_type = src_node.get("data", {}).get("type", "")
                     src_schema = src_node.get("data", {}).get("node", {})
-                    if src_schema.get("tool_mode"):
-                        outputs = src_schema.get("outputs", [])
-                        tool_out = next(
-                            (o for o in outputs if o.get("tool_mode")),
-                            next((o for o in outputs if o.get("name") == "component_as_tool"), None),
-                        )
-                        if tool_out:
+                    outputs = src_schema.get("outputs", [])
+                    if src_type not in self._NEVER_TOOL:
+                        native_out = next((o for o in outputs if o.get("name") == "api_build_tool"), None)
+                        if native_out:
                             sh = dict(sh)
-                            sh["name"] = tool_out.get("name", "component_as_tool")
+                            sh["name"] = "api_build_tool"
                             sh["output_types"] = ["Tool"]
+                        else:
+                            tool_out = next((o for o in outputs if o.get("tool_mode")), None)
+                            if not tool_out:
+                                # No explicit tool output — enable tool_mode so Langflow wraps it
+                                src_schema["tool_mode"] = True
+                                tool_out = next(
+                                    (o for o in outputs if o.get("name") == "component_as_tool"), None
+                                )
+                            if tool_out:
+                                sh = dict(sh)
+                                sh["name"] = tool_out.get("name", "api_build_tool")
+                                sh["output_types"] = ["Tool"]
 
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
             # JSON.stringify(obj).replace(/"/g, "œ")) — sun() validation requires this format.
-            if isinstance(sh, dict):
-                edge["sourceHandle"] = json.dumps(sh).replace('"', 'œ')
-            if isinstance(th, dict):
-                edge["targetHandle"] = json.dumps(th).replace('"', 'œ')
+            edge["sourceHandle"] = json.dumps(sh).replace('"', 'œ')
+            edge["targetHandle"] = json.dumps(th).replace('"', 'œ')
 
             # Ensure unique edge ID
             if "id" not in edge:
@@ -335,9 +370,15 @@ class LangflowMCPClient:
             n for n in nodes
             if "tools" in n.get("data", {}).get("node", {}).get("template", {})
         ]
+        # Detect tool-capable nodes: either tool_mode=True (set by _auto_tool_mode for
+        # non-native tools) OR has native api_build_tool output (CalculatorTool, SearchAPI, etc.)
         tool_nodes = [
             n for n in nodes
             if n.get("data", {}).get("node", {}).get("tool_mode")
+            or any(
+                o.get("name") == "api_build_tool"
+                for o in n.get("data", {}).get("node", {}).get("outputs", [])
+            )
         ]
         if not agent_nodes or not tool_nodes:
             return edges
@@ -366,9 +407,11 @@ class LangflowMCPClient:
                     continue
                 tool_comp_type = tool_node.get("data", {}).get("type", "")
                 outputs = tool_node.get("data", {}).get("node", {}).get("outputs", [])
-                tool_out = next(
-                    (o for o in outputs if o.get("tool_mode")),
-                    next((o for o in outputs if o.get("name") == "component_as_tool"), None),
+                # Same priority order as enrich_edges: native api_build_tool first, then tool_mode
+                tool_out = (
+                    next((o for o in outputs if o.get("name") == "api_build_tool"), None)
+                    or next((o for o in outputs if o.get("tool_mode")), None)
+                    or next((o for o in outputs if o.get("name") == "component_as_tool"), None)
                 )
                 if not tool_out:
                     continue
@@ -390,6 +433,42 @@ class LangflowMCPClient:
                 })
                 existing.add((tool_id, agent_id))
         return new_edges
+
+    async def fetch_starter(self, name_or_id: str) -> dict | None:
+        """Look up a starter template by name or id. Checks Redis first, then HTTP."""
+        key = name_or_id.strip()
+        if self._redis_cache:
+            data = await self._redis_cache.get_starter_data(key)
+            if data:
+                return data
+        # HTTP fallback: GET /api/v1/flows/basic_examples/
+        url = f"{self._langflow_base_url}/api/v1/flows/basic_examples/"
+        req = urllib.request.Request(url, headers={"x-api-key": self._langflow_api_key})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                starters = json.loads(resp.read())
+            q = key.lower()
+            match = next(
+                (s for s in starters if s.get("id") == key or q in s.get("name", "").lower()),
+                None,
+            )
+            if match and self._redis_cache:
+                await self._redis_cache.sync_starters(starters)
+            return match
+        except Exception as e:
+            logger.warning("fetch_starter HTTP fallback failed: %s", e)
+            return None
+
+    def _create_flow_direct(self, name: str, description: str, data: dict) -> dict:
+        """POST a complete flow directly to /api/v1/flows/. Bypasses MCP."""
+        url = f"{self._langflow_base_url}/api/v1/flows/"
+        payload = json.dumps({"name": name, "description": description, "data": data}).encode()
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"x-api-key": self._langflow_api_key, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
 
     def test_run_flow(self, flow_id: str, input_value: str = "2+2") -> dict:
         """POST to /api/v1/run/{flow_id} with dummy input. Returns {ok, answer, error}."""
@@ -432,6 +511,27 @@ class LangflowMCPClient:
     }
 
     _VIRTUAL_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "clone_starter_template",
+                "description": (
+                    "Clone a starter template into a new flow server-side — "
+                    "no need to call get_basic_examples, get_starter_template, or create_flow. "
+                    "Use for Score ≥ 8.5 direct clones. "
+                    "Returns {flow_id, name, node_count, edge_count}."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name_or_id": {"type": "string", "description": "Template name (e.g. 'Simple Agent') or id"},
+                        "name": {"type": "string", "description": "Name for the new flow (defaults to template name)"},
+                        "description": {"type": "string", "description": "Description for the new flow"},
+                    },
+                    "required": ["name_or_id"],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
