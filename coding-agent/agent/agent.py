@@ -144,6 +144,20 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
             for o in n.get("data", {}).get("node", {}).get("outputs", [])
         )
 
+    def _find_model_field(n: dict) -> str | None:
+        """Return template field name of the first ModelInput that accepts LanguageModel, or None."""
+        tmpl = n.get("data", {}).get("node", {}).get("template", {})
+        for k, v in tmpl.items():
+            if isinstance(v, dict) and v.get("type") == "model" and "LanguageModel" in (v.get("input_types") or []):
+                return k
+        return None
+
+    def _has_only_tool_outputs(n: dict) -> bool:
+        """True if a node's only outputs are tool handles (component_as_tool/api_build_tool).
+        Such nodes MUST be used as Agent tools — they have no data output for pipeline use."""
+        outputs = n.get("data", {}).get("node", {}).get("outputs", [])
+        return bool(outputs) and all(o.get("name") in ("component_as_tool", "api_build_tool") for o in outputs)
+
     console.print(Panel(
         "[bold green]Langflow Coding Agent[/bold green]\n"
         "Type your request. Ctrl+C or 'exit' to quit.",
@@ -307,17 +321,46 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     )
                                     azure_stub = [{"id": "AzureOpenAIModel-1", "type": "AzureOpenAIModel", "position": removed_pos, "data": {"type": "AzureOpenAIModel", "id": "AzureOpenAIModel-1"}}]
                                     data["nodes"].extend(mcp.enrich_nodes(azure_stub, credential_overrides=credential_overrides))
-                                    agent_ns = [n for n in data["nodes"] if "model" in n.get("data", {}).get("node", {}).get("template", {})]
-                                    for agent_n in agent_ns:
-                                        if agent_n.get("data", {}).get("type") in ("Agent",):
-                                            data["edges"].append({
-                                                "source": "AzureOpenAIModel-1",
-                                                "target": agent_n.get("id"),
-                                                "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
-                                                "targetHandle": {"fieldName": "model", "id": agent_n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
-                                            })
-                                    console.print("[dim]↳ injected AzureOpenAIModel → Agent.model[/dim]")
-                                elif len(llm_nodes) > 1:
+                                # Wire AzureOpenAI to ALL nodes with ModelInput fields (Agent, StructuredOutput, etc.)
+                                for _n in data["nodes"]:
+                                    if _n.get("data", {}).get("type") == "AzureOpenAIModel":
+                                        continue
+                                    _mf = _find_model_field(_n)
+                                    if _mf:
+                                        data["edges"].append({
+                                            "source": "AzureOpenAIModel-1",
+                                            "target": _n.get("id"),
+                                            "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                            "targetHandle": {"fieldName": _mf, "id": _n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
+                                        })
+                                console.print("[dim]↳ wired AzureOpenAIModel → all ModelInput fields[/dim]")
+                                # Inject Agent when tool-only components exist without one
+                                _cf_has_agent = any(n.get("data", {}).get("type") == "Agent" for n in data["nodes"])
+                                _cf_has_tool_only = any(_has_only_tool_outputs(n) for n in data["nodes"])
+                                if _cf_has_tool_only and not _cf_has_agent:
+                                    _agent_stub = [{"id": "Agent-1", "type": "Agent", "position": {"x": 670, "y": 540}, "data": {"type": "Agent", "id": "Agent-1"}}]
+                                    data["nodes"].extend(mcp.enrich_nodes(_agent_stub, credential_overrides=credential_overrides))
+                                    _ci = next((n for n in data["nodes"] if n.get("data", {}).get("type") == "ChatInput"), None)
+                                    if _ci:
+                                        data["edges"].append({
+                                            "source": _ci.get("id"), "target": "Agent-1",
+                                            "sourceHandle": {"dataType": "ChatInput", "id": _ci.get("id"), "name": "message", "output_types": ["Message"]},
+                                            "targetHandle": {"fieldName": "input_value", "id": "Agent-1", "inputTypes": ["Message"], "type": "str"},
+                                        })
+                                    data["edges"].append({
+                                        "source": "AzureOpenAIModel-1", "target": "Agent-1",
+                                        "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                        "targetHandle": {"fieldName": "model", "id": "Agent-1", "inputTypes": ["LanguageModel"], "type": "model"},
+                                    })
+                                    _co = next((n for n in data["nodes"] if n.get("data", {}).get("type") == "ChatOutput"), None)
+                                    if _co:
+                                        data["edges"].append({
+                                            "source": "Agent-1", "target": _co.get("id"),
+                                            "sourceHandle": {"dataType": "Agent", "id": "Agent-1", "name": "response", "output_types": ["Message"]},
+                                            "targetHandle": {"fieldName": "input_value", "id": _co.get("id"), "inputTypes": ["Data", "JSON", "DataFrame", "Table", "Message"], "type": "other"},
+                                        })
+                                    console.print("[dim]↳ injected Agent + wired ChatInput→Agent→ChatOutput[/dim]")
+                                if azure_llm and len(llm_nodes) > 1:
                                     extra_llm_ids = {n.get("id", "") for n in llm_nodes if n is not azure_llm}
                                     data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in extra_llm_ids]
                                     data["edges"] = [
@@ -387,16 +430,47 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                         )
                                         azure_stub = [{"id": "AzureOpenAIModel-1", "type": "AzureOpenAIModel", "position": removed_pos, "data": {"type": "AzureOpenAIModel", "id": "AzureOpenAIModel-1"}}]
                                         tdata["nodes"].extend(mcp.enrich_nodes(azure_stub, credential_overrides=_credential_overrides))
-                                        agent_ns = [n for n in tdata["nodes"] if "model" in n.get("data", {}).get("node", {}).get("template", {})]
-                                        for agent_n in agent_ns:
-                                            if agent_n.get("data", {}).get("type") in ("Agent",):
-                                                tdata["edges"].append({
-                                                    "source": "AzureOpenAIModel-1",
-                                                    "target": agent_n.get("id"),
-                                                    "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
-                                                    "targetHandle": {"fieldName": "model", "id": agent_n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
-                                                })
-                                        console.print("[dim]↳ injected AzureOpenAIModel → Agent.model[/dim]")
+                                    # Wire AzureOpenAI to ALL nodes with ModelInput fields (Agent, StructuredOutput, etc.)
+                                    for _n in tdata["nodes"]:
+                                        if _n.get("data", {}).get("type") == "AzureOpenAIModel":
+                                            continue
+                                        _mf = _find_model_field(_n)
+                                        if _mf:
+                                            tdata["edges"].append({
+                                                "source": "AzureOpenAIModel-1",
+                                                "target": _n.get("id"),
+                                                "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                                "targetHandle": {"fieldName": _mf, "id": _n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
+                                            })
+                                    console.print("[dim]↳ wired AzureOpenAIModel → all ModelInput fields[/dim]")
+                                    # Inject Agent when tool-only components exist without one.
+                                    # Nodes whose only outputs are component_as_tool/api_build_tool cannot
+                                    # connect via data edges — an Agent is mandatory to use them.
+                                    _has_agent = any(n.get("data", {}).get("type") == "Agent" for n in tdata["nodes"])
+                                    _has_tool_only = any(_has_only_tool_outputs(n) for n in tdata["nodes"])
+                                    if _has_tool_only and not _has_agent:
+                                        _agent_stub = [{"id": "Agent-1", "type": "Agent", "position": {"x": 670, "y": 540}, "data": {"type": "Agent", "id": "Agent-1"}}]
+                                        tdata["nodes"].extend(mcp.enrich_nodes(_agent_stub, credential_overrides=_credential_overrides))
+                                        _ci = next((n for n in tdata["nodes"] if n.get("data", {}).get("type") == "ChatInput"), None)
+                                        if _ci:
+                                            tdata["edges"].append({
+                                                "source": _ci.get("id"), "target": "Agent-1",
+                                                "sourceHandle": {"dataType": "ChatInput", "id": _ci.get("id"), "name": "message", "output_types": ["Message"]},
+                                                "targetHandle": {"fieldName": "input_value", "id": "Agent-1", "inputTypes": ["Message"], "type": "str"},
+                                            })
+                                        tdata["edges"].append({
+                                            "source": "AzureOpenAIModel-1", "target": "Agent-1",
+                                            "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                            "targetHandle": {"fieldName": "model", "id": "Agent-1", "inputTypes": ["LanguageModel"], "type": "model"},
+                                        })
+                                        _co = next((n for n in tdata["nodes"] if n.get("data", {}).get("type") == "ChatOutput"), None)
+                                        if _co:
+                                            tdata["edges"].append({
+                                                "source": "Agent-1", "target": _co.get("id"),
+                                                "sourceHandle": {"dataType": "Agent", "id": "Agent-1", "name": "response", "output_types": ["Message"]},
+                                                "targetHandle": {"fieldName": "input_value", "id": _co.get("id"), "inputTypes": ["Data", "JSON", "DataFrame", "Table", "Message"], "type": "other"},
+                                            })
+                                        console.print("[dim]↳ injected Agent + wired ChatInput→Agent→ChatOutput[/dim]")
                                     tdata["edges"] = mcp.ensure_tool_edges(tdata["nodes"], tdata.get("edges", []))
                                     tdata["edges"] = mcp.enrich_edges(tdata["edges"], tdata["nodes"])
                                     created = mcp._create_flow_direct(
