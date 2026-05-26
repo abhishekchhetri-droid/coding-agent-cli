@@ -8,10 +8,15 @@ class ToolCall(TypedDict):
     arguments: dict
 
 
-class Usage(TypedDict):
+class _UsageBase(TypedDict):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+
+
+class Usage(_UsageBase, total=False):
+    cache_creation_tokens: int
+    cache_read_tokens: int
 
 
 class LLMResponse(TypedDict):

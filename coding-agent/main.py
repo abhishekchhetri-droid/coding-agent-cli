@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from config.settings import Settings
 from mcpbridge.client import LangflowMCPClient
+from mcpbridge.redis_cache import RedisEntityCache
 from agent.cmd import run_cmd, CmdError
 
 
@@ -24,10 +25,19 @@ async def _main(settings: Settings) -> None:
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
+    redis_cache = None
+    if settings.redis_url:
+        redis_cache = RedisEntityCache(
+            redis_url=settings.redis_url,
+            sync_interval=settings.redis_sync_interval,
+            top_k=settings.entity_top_k,
+        )
+
     mcp = LangflowMCPClient(
         mcp_path=settings.langflow_mcp_path,
         langflow_api_key=settings.langflow_api_key,
         langflow_base_url=settings.langflow_base_url,
+        redis_cache=redis_cache,
     )
 
     print("connecting…", end="\r", flush=True)

@@ -1,5 +1,7 @@
+import asyncio
 import gzip
 import json
+import logging
 import os
 from contextlib import AsyncExitStack
 from typing import Any
@@ -8,6 +10,9 @@ import urllib.request
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcpbridge.redis_cache import RedisEntityCache
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_text(obj: Any, depth: int = 0) -> str:
@@ -32,7 +37,13 @@ def _extract_text(obj: Any, depth: int = 0) -> str:
 
 
 class LangflowMCPClient:
-    def __init__(self, mcp_path: str, langflow_api_key: str, langflow_base_url: str) -> None:
+    def __init__(
+        self,
+        mcp_path: str,
+        langflow_api_key: str,
+        langflow_base_url: str,
+        redis_cache: RedisEntityCache | None = None,
+    ) -> None:
         self._mcp_path = mcp_path
         self._langflow_api_key = langflow_api_key
         self._langflow_base_url = langflow_base_url.rstrip("/")
@@ -47,6 +58,8 @@ class LangflowMCPClient:
         self._tools_cache: list[Any] = []
         self._exit_stack: AsyncExitStack | None = None
         self._component_schema_cache: dict[str, Any] = {}  # type_name → full schema
+        self._redis_cache = redis_cache
+        self._sync_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
         self._exit_stack = AsyncExitStack()
@@ -71,6 +84,42 @@ class LangflowMCPClient:
         await self._session.initialize()
         result = await self._session.list_tools()
         self._tools_cache = result.tools
+
+        if self._redis_cache and await self._redis_cache.connect():
+            try:
+                flows_raw = await self._session_call_json("list_flows", {})
+                starters_raw = await self._session_call_json("list_starter_projects", {})
+                if isinstance(flows_raw, list):
+                    await self._redis_cache.sync_flows(flows_raw)
+                if isinstance(starters_raw, list):
+                    await self._redis_cache.sync_starters(starters_raw)
+                self._sync_task = asyncio.create_task(self._background_sync())
+            except Exception as e:
+                logger.warning("Redis cold sync failed: %s", e)
+
+    async def _session_call_json(self, tool_name: str, args: dict) -> Any:
+        result = await self._session.call_tool(tool_name, args)
+        if not result.content:
+            return None
+        item = result.content[0]
+        text = item.text if hasattr(item, "text") else str(item)
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+
+    async def _background_sync(self) -> None:
+        while True:
+            await asyncio.sleep(self._redis_cache._sync_interval)
+            try:
+                flows_raw = await self._session_call_json("list_flows", {})
+                starters_raw = await self._session_call_json("list_starter_projects", {})
+                if isinstance(flows_raw, list):
+                    await self._redis_cache.sync_flows(flows_raw)
+                if isinstance(starters_raw, list):
+                    await self._redis_cache.sync_starters(starters_raw)
+            except Exception as e:
+                logger.warning("Redis background sync error: %s", e)
 
     def _fetch_component_schemas(self) -> dict[str, Any]:
         """Fetch all component schemas from /api/v1/all. Cached after first call."""
@@ -327,6 +376,24 @@ class LangflowMCPClient:
         {
             "type": "function",
             "function": {
+                "name": "search_flows",
+                "description": (
+                    "Search user flows by keyword. Returns [{id, name, description}] for matching flows. "
+                    "Use instead of list_flows when looking for a specific flow by name or topic."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Keyword to search flow names and descriptions"},
+                        "limit": {"type": "integer", "default": 15},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "get_component_schema",
                 "description": (
                     "Get exact input field names and output handle names for a specific component type. "
@@ -416,7 +483,54 @@ class LangflowMCPClient:
     async def call_tool(self, name: str, arguments: dict) -> Any:
         if self._session is None:
             raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        # search_flows virtual tool
+        if name == "search_flows":
+            query = arguments.get("query", "")
+            limit = arguments.get("limit", 15)
+            if self._redis_cache and await self._redis_cache.is_warm():
+                results = await self._redis_cache.search_flows(query, limit)
+                return json.dumps(results)
+            # Fallback: MCP list_flows then filter
+            all_flows = await self._session_call_json("list_flows", {})
+            if isinstance(all_flows, list):
+                q = query.lower()
+                filtered = [
+                    {"id": f.get("id"), "name": f.get("name", ""), "description": f.get("description", "")}
+                    for f in all_flows
+                    if q in f.get("name", "").lower() or q in (f.get("description") or "").lower()
+                ]
+                return json.dumps(filtered[:limit])
+            return json.dumps([])
+
+        # Redis-cached list_flows
+        if name == "list_flows" and self._redis_cache:
+            if await self._redis_cache.is_warm():
+                flows = await self._redis_cache.list_all_flows()
+                return json.dumps(flows)
+
+        # Redis-cached list_starter_projects
+        if name == "list_starter_projects" and self._redis_cache:
+            if await self._redis_cache.is_warm():
+                starters = await self._redis_cache.list_all_starters()
+                return json.dumps(starters)
+
         result = await self._session.call_tool(name, arguments)
+
+        # Lazy populate Redis on first MCP call when cold
+        if name in ("list_flows", "list_starter_projects") and self._redis_cache and result.content:
+            item0 = result.content[0]
+            raw_text = item0.text if hasattr(item0, "text") else str(item0)
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, list):
+                    if name == "list_flows":
+                        await self._redis_cache.sync_flows(parsed)
+                    else:
+                        await self._redis_cache.sync_starters(parsed)
+            except Exception:
+                pass
+
         if not result.content:
             return None
         item = result.content[0]
@@ -425,6 +539,11 @@ class LangflowMCPClient:
         return str(item)
 
     async def close(self) -> None:
+        if self._sync_task:
+            self._sync_task.cancel()
+            self._sync_task = None
+        if self._redis_cache:
+            await self._redis_cache.close()
         if self._exit_stack:
             try:
                 await self._exit_stack.aclose()

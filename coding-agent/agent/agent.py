@@ -176,13 +176,18 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
             iter_prompt = 0
             iter_completion = 0
+            cache_read = 0
+            cache_write = 0
             if response["usage"]:
                 iter_prompt = response["usage"]["prompt_tokens"]
                 iter_completion = response["usage"]["completion_tokens"]
+                cache_read = response["usage"].get("cache_read_tokens", 0) or 0
+                cache_write = response["usage"].get("cache_creation_tokens", 0) or 0
                 prompt_tokens += iter_prompt
                 completion_tokens += iter_completion
+            cache_str = f" · 📦 r={cache_read:,} w={cache_write:,}" if cache_read or cache_write else ""
             console.print(
-                f"[dim]⏱ {elapsed:.1f}s · ↑{iter_prompt:,} ↓{iter_completion:,} tokens[/dim]"
+                f"[dim]⏱ {elapsed:.1f}s · ↑{iter_prompt:,} ↓{iter_completion:,} tokens{cache_str}[/dim]"
             )
 
             if response["tool_calls"]:
