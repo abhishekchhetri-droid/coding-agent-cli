@@ -256,7 +256,8 @@ class LangflowMCPClient:
             if "tools" in schema.get("template", {}):
                 continue
             outputs = schema.get("outputs", [])
-            has_native_tool = any(o.get("name") == "api_build_tool" for o in outputs)
+            # Both api_build_tool (older Langflow) and component_as_tool (current) signal native tool
+            has_native_tool = any(o.get("name") in ("api_build_tool", "component_as_tool") for o in outputs)
             if has_native_tool:
                 continue  # already a native tool, no wrapping needed
             # Detect tool capability from INPUT fields — this is where Langflow components
@@ -268,6 +269,28 @@ class LangflowMCPClient:
             )
             if has_tool_input:
                 schema["tool_mode"] = True
+                # Inject component_as_tool output — the exact schema Langflow uses for
+                # tool-wrapped components (to_toolkit method). Without this, enrich_edges
+                # and ensure_tool_edges can't find the tool output after enrich_nodes
+                # overwrites data.node with the pre-tool_mode schema from /api/v1/all.
+                outputs = schema.setdefault("outputs", [])
+                if not any(o.get("name") == "component_as_tool" for o in outputs):
+                    outputs.append({
+                        "allows_loop": False,
+                        "cache": True,
+                        "display_name": "Toolset",
+                        "group_outputs": False,
+                        "hidden": None,
+                        "loop_types": None,
+                        "method": "to_toolkit",
+                        "name": "component_as_tool",
+                        "options": None,
+                        "required_inputs": None,
+                        "selected": "Tool",
+                        "tool_mode": True,
+                        "types": ["Tool"],
+                        "value": "__UNDEFINED__",
+                    })
 
     @staticmethod
     def _parse_handle(handle: Any) -> dict:
@@ -338,23 +361,27 @@ class LangflowMCPClient:
                     src_schema = src_node.get("data", {}).get("node", {})
                     outputs = src_schema.get("outputs", [])
                     if src_type not in self._NEVER_TOOL:
-                        native_out = next((o for o in outputs if o.get("name") == "api_build_tool"), None)
+                        # Priority 1: native tool output (api_build_tool or component_as_tool)
+                        native_out = next(
+                            (o for o in outputs if o.get("name") in ("api_build_tool", "component_as_tool")),
+                            None,
+                        )
                         if native_out:
                             sh = dict(sh)
-                            sh["name"] = "api_build_tool"
+                            sh["name"] = native_out["name"]
                             sh["output_types"] = ["Tool"]
                         else:
                             tool_out = next((o for o in outputs if o.get("tool_mode")), None)
                             if tool_out:
-                                # Explicit tool-mode output declared in schema (URLComponent.page_results etc.)
+                                # Priority 2: any output with tool_mode=True in schema
                                 sh = dict(sh)
-                                sh["name"] = tool_out.get("name", "api_build_tool")
+                                sh["name"] = tool_out.get("name", "component_as_tool")
                                 sh["output_types"] = ["Tool"]
                             else:
-                                # Generic wrapper — enable tool_mode, Langflow exposes api_build_tool handle
+                                # Priority 3: fallback — enable tool_mode, use component_as_tool
                                 src_schema["tool_mode"] = True
                                 sh = dict(sh)
-                                sh["name"] = "api_build_tool"
+                                sh["name"] = "component_as_tool"
                                 sh["output_types"] = ["Tool"]
 
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
@@ -388,13 +415,12 @@ class LangflowMCPClient:
             n for n in nodes
             if "tools" in n.get("data", {}).get("node", {}).get("template", {})
         ]
-        # Detect tool-capable nodes: either tool_mode=True (set by _auto_tool_mode for
-        # non-native tools) OR has native api_build_tool output (CalculatorTool, SearchAPI, etc.)
+        # Detect tool-capable nodes: tool_mode=True OR has component_as_tool/api_build_tool output
         tool_nodes = [
             n for n in nodes
             if n.get("data", {}).get("node", {}).get("tool_mode")
             or any(
-                o.get("name") == "api_build_tool"
+                o.get("name") in ("api_build_tool", "component_as_tool")
                 for o in n.get("data", {}).get("node", {}).get("outputs", [])
             )
         ]
@@ -425,11 +451,10 @@ class LangflowMCPClient:
                     continue
                 tool_comp_type = tool_node.get("data", {}).get("type", "")
                 outputs = tool_node.get("data", {}).get("node", {}).get("outputs", [])
-                # Same priority order as enrich_edges: native api_build_tool first, then tool_mode
+                # Priority: component_as_tool/api_build_tool (native) → tool_mode output → fallback
                 tool_out = (
-                    next((o for o in outputs if o.get("name") == "api_build_tool"), None)
+                    next((o for o in outputs if o.get("name") in ("component_as_tool", "api_build_tool")), None)
                     or next((o for o in outputs if o.get("tool_mode")), None)
-                    or next((o for o in outputs if o.get("name") == "component_as_tool"), None)
                 )
                 if not tool_out:
                     continue
