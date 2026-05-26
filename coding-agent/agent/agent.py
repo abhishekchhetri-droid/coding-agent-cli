@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 from rich.console import Console
 from rich.markdown import Markdown
@@ -164,11 +165,28 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         completion_tokens = 0
         turn_start = time.perf_counter()
 
+        _THINKING_WORDS = [
+            "Thinking", "Pondering", "Cogitating", "Marinating", "Ruminating",
+            "Deliberating", "Analyzing", "Reasoning", "Contemplating", "Brewing",
+            "Calculating", "Reflecting", "Theorizing", "Synthesizing", "Formulating",
+            "Extrapolating", "Inferring", "Deducing", "Hallucinating", "Vibing",
+            "Cooking", "Simmering", "Baking", "Percolating", "Noodling",
+        ]
+
+        async def _cycle_status(status_obj: object) -> None:
+            while True:
+                await asyncio.sleep(2)
+                status_obj.update(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]")
+
         while iterations < settings.max_tool_iterations:
             try:
                 t0 = time.perf_counter()
-                with console.status("[dim]thinking…[/dim]", spinner="dots"):
-                    response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+                with console.status(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]", spinner="dots") as _status:
+                    _cycle = asyncio.create_task(_cycle_status(_status))
+                    try:
+                        response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+                    finally:
+                        _cycle.cancel()
                 elapsed = time.perf_counter() - t0
             except (KeyboardInterrupt, asyncio.CancelledError):
                 console.print("\n[dim]Interrupted.[/dim]")
@@ -275,6 +293,8 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     ]
                                     for eid in extra_llm_ids:
                                         console.print(f"[yellow]↳ dedup: removed extra LLM node '{eid}'[/yellow]")
+                                # Auto-add missing tool→Agent edges (LLM often omits them)
+                                data["edges"] = mcp.ensure_tool_edges(data["nodes"], data.get("edges", []))
                                 if "edges" in data:
                                     data["edges"] = mcp.enrich_edges(data["edges"], data["nodes"])
                                 args = {**args, "data": data}

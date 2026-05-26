@@ -284,27 +284,22 @@ class LangflowMCPClient:
                     if actual_type:
                         th["type"] = actual_type
 
-            # Rewrite sourceHandle for tool-mode connections to Agent.tools
-            if (
-                isinstance(sh, dict)
-                and isinstance(th, dict)
-                and th.get("fieldName") == "tools"
-                and sh.get("name") in (None, "", "api_build_tool")
-            ):
+            # Rewrite sourceHandle for tool-mode connections to Agent.tools.
+            # Always rewrite when target is tools input — regardless of sh["name"].
+            # The LLM may pass the original (non-tool-mode) output name from the template.
+            if isinstance(sh, dict) and isinstance(th, dict) and th.get("fieldName") == "tools":
                 src_node = node_by_id.get(edge.get("source", ""))
                 if src_node:
                     src_schema = src_node.get("data", {}).get("node", {})
                     if src_schema.get("tool_mode"):
                         outputs = src_schema.get("outputs", [])
-                        # Prefer an output explicitly flagged tool_mode=True;
-                        # fall back to first output (Langflow wraps it as Tool when tool_mode is on).
                         tool_out = next(
                             (o for o in outputs if o.get("tool_mode")),
-                            outputs[0] if outputs else None,
+                            next((o for o in outputs if o.get("name") == "component_as_tool"), None),
                         )
                         if tool_out:
                             sh = dict(sh)
-                            sh["name"] = tool_out.get("name", sh.get("name", ""))
+                            sh["name"] = tool_out.get("name", "component_as_tool")
                             sh["output_types"] = ["Tool"]
 
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
@@ -328,6 +323,73 @@ class LangflowMCPClient:
 
             result.append(edge)
         return result
+
+    def ensure_tool_edges(self, nodes: list[dict], edges: list[dict]) -> list[dict]:
+        """Auto-add missing Tool→Agent.tools edges when tool-capable nodes have no connection.
+
+        Called after enrich_nodes (which sets tool_mode) and before enrich_edges (which
+        serializes handles). Detects any enriched node with tool_mode=True that lacks an
+        edge to an Agent's tools input, and synthesizes the missing connections.
+        """
+        agent_nodes = [
+            n for n in nodes
+            if "tools" in n.get("data", {}).get("node", {}).get("template", {})
+        ]
+        tool_nodes = [
+            n for n in nodes
+            if n.get("data", {}).get("node", {}).get("tool_mode")
+        ]
+        if not agent_nodes or not tool_nodes:
+            return edges
+
+        # Track existing tool-edge pairs (source_id, target_id)
+        existing: set[tuple[str, str]] = set()
+        for e in edges:
+            th_raw = e.get("targetHandle", {})
+            if isinstance(th_raw, str):
+                try:
+                    th = json.loads(th_raw.replace("œ", '"'))
+                except Exception:
+                    th = {}
+            else:
+                th = th_raw
+            if isinstance(th, dict) and th.get("fieldName") == "tools":
+                existing.add((e.get("source", ""), e.get("target", "")))
+
+        new_edges = list(edges)
+        for agent_node in agent_nodes:
+            agent_id = agent_node.get("id", "")
+            agent_type = agent_node.get("data", {}).get("type", "Agent")
+            for tool_node in tool_nodes:
+                tool_id = tool_node.get("id", "")
+                if (tool_id, agent_id) in existing:
+                    continue
+                tool_comp_type = tool_node.get("data", {}).get("type", "")
+                outputs = tool_node.get("data", {}).get("node", {}).get("outputs", [])
+                tool_out = next(
+                    (o for o in outputs if o.get("tool_mode")),
+                    next((o for o in outputs if o.get("name") == "component_as_tool"), None),
+                )
+                if not tool_out:
+                    continue
+                new_edges.append({
+                    "source": tool_id,
+                    "target": agent_id,
+                    "sourceHandle": {
+                        "dataType": tool_comp_type,
+                        "id": tool_id,
+                        "name": tool_out.get("name", "component_as_tool"),
+                        "output_types": ["Tool"],
+                    },
+                    "targetHandle": {
+                        "fieldName": "tools",
+                        "id": agent_id,
+                        "inputTypes": ["Tool"],
+                        "type": "other",
+                    },
+                })
+                existing.add((tool_id, agent_id))
+        return new_edges
 
     def test_run_flow(self, flow_id: str, input_value: str = "2+2") -> dict:
         """POST to /api/v1/run/{flow_id} with dummy input. Returns {ok, answer, error}."""
