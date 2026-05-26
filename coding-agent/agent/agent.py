@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -134,6 +135,7 @@ def _assistant_tool_call_message(tool_calls: list[dict]) -> dict:
 async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings) -> None:
     tools = mcp.get_tool_schemas()
     messages: list[dict] = []
+    _starter_cache: dict[str, dict] = {}  # name_lower/id → full template dict
 
     console.print(Panel(
         "[bold green]Langflow Coding Agent[/bold green]\n"
@@ -160,28 +162,40 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         iterations = 0
         prompt_tokens = 0
         completion_tokens = 0
+        turn_start = time.perf_counter()
 
         while iterations < settings.max_tool_iterations:
             try:
+                t0 = time.perf_counter()
                 with console.status("[dim]thinking…[/dim]", spinner="dots"):
                     response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+                elapsed = time.perf_counter() - t0
             except (KeyboardInterrupt, asyncio.CancelledError):
                 console.print("\n[dim]Interrupted.[/dim]")
                 return
 
+            iter_prompt = 0
+            iter_completion = 0
             if response["usage"]:
-                prompt_tokens += response["usage"]["prompt_tokens"]
-                completion_tokens += response["usage"]["completion_tokens"]
+                iter_prompt = response["usage"]["prompt_tokens"]
+                iter_completion = response["usage"]["completion_tokens"]
+                prompt_tokens += iter_prompt
+                completion_tokens += iter_completion
+            console.print(
+                f"[dim]⏱ {elapsed:.1f}s · ↑{iter_prompt:,} ↓{iter_completion:,} tokens[/dim]"
+            )
 
             if response["tool_calls"]:
                 for tc in response["tool_calls"]:
-                    console.print(
-                        f"[dim]→ {tc['name']}({json.dumps(tc['arguments'], indent=None)})[/dim]"
-                    )
+                    args_str = json.dumps(tc['arguments'], indent=None)
+                    if len(args_str) > 300:
+                        args_str = args_str[:300] + "…"
+                    console.print(f"[dim]→ {tc['name']}({args_str})[/dim]")
 
                 messages.append(_assistant_tool_call_message(response["tool_calls"]))
 
                 _last_build_flow_id: str | None = None
+                _starter_template_msg_ids: set[str] = set()
                 for tc in response["tool_calls"]:
                     args = tc["arguments"]
 
@@ -208,7 +222,54 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                         "azure_deployment": settings.azure_openai_deployment,
                                         "api_version": settings.azure_openai_api_version,
                                     }
+                                # Deduplicate structural singletons (non-LLM) by type name
+                                _STRUCTURAL_SINGLETONS = {"ChatInput", "ChatOutput", "Agent"}
+                                seen_singletons: set[str] = set()
+                                deduped: list[dict] = []
+                                removed_ids: set[str] = set()
+                                for _n in data["nodes"]:
+                                    _nt = _n.get("data", {}).get("type") or _n.get("type", "")
+                                    if _nt in _STRUCTURAL_SINGLETONS and _nt in seen_singletons:
+                                        removed_ids.add(_n.get("id", ""))
+                                        console.print(f"[yellow]↳ dedup: removed extra '{_nt}' node[/yellow]")
+                                        continue
+                                    seen_singletons.add(_nt)
+                                    deduped.append(_n)
+                                if removed_ids:
+                                    data["nodes"] = deduped
+                                # Drop orphan edges before enrichment
+                                valid_node_ids = {n.get("id", "") for n in data["nodes"]}
+                                orphans_before = len(data.get("edges", []))
+                                data["edges"] = [
+                                    e for e in data.get("edges", [])
+                                    if e.get("source") in valid_node_ids and e.get("target") in valid_node_ids
+                                ]
+                                orphans_dropped = orphans_before - len(data["edges"])
+                                if orphans_dropped:
+                                    console.print(f"[yellow]↳ dropped {orphans_dropped} orphan edge(s) with missing node references[/yellow]")
                                 data["nodes"] = mcp.enrich_nodes(data["nodes"], credential_overrides=credential_overrides)
+                                # Dynamic LLM dedup (post-enrichment): detect by LanguageModel output type.
+                                # Catches ANY LLM component regardless of name (LanguageModelComponent,
+                                # AzureOpenAIModel, OpenAI, etc.) — always keeps AzureOpenAIModel.
+                                def _node_outputs_langmodel(n: dict) -> bool:
+                                    return any(
+                                        "LanguageModel" in (o.get("types") or o.get("output_types") or [])
+                                        for o in n.get("data", {}).get("node", {}).get("outputs", [])
+                                    )
+                                llm_nodes = [n for n in data["nodes"] if _node_outputs_langmodel(n)]
+                                if len(llm_nodes) > 1:
+                                    preferred_llm = next(
+                                        (n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"),
+                                        llm_nodes[0],
+                                    )
+                                    extra_llm_ids = {n.get("id", "") for n in llm_nodes if n is not preferred_llm}
+                                    data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in extra_llm_ids]
+                                    data["edges"] = [
+                                        e for e in data.get("edges", [])
+                                        if e.get("source") not in extra_llm_ids and e.get("target") not in extra_llm_ids
+                                    ]
+                                    for eid in extra_llm_ids:
+                                        console.print(f"[yellow]↳ dedup: removed extra LLM node '{eid}'[/yellow]")
                                 if "edges" in data:
                                     data["edges"] = mcp.enrich_edges(data["edges"], data["nodes"])
                                 args = {**args, "data": data}
@@ -222,13 +283,48 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         # Refuse to send broken nodes to Langflow. Return error as tool result so LLM retries.
                         result = f"ERROR: {enrich_error} Do NOT retry blindly — call list_components first and find the exact 'type' string."
                     elif tc["name"] == "get_component_schema":
-                        # Virtual tool — handled locally, no MCP call needed
                         result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
+                    elif tc["name"] == "get_starter_template":
+                        # Virtual tool — look up cached starter data, return full template for ONE winner
+                        key = (args.get("name_or_id") or "").strip().lower()
+                        match = _starter_cache.get(key)
+                        if not match:
+                            # Try partial name match
+                            for k, v in _starter_cache.items():
+                                if key in k or k in key:
+                                    match = v
+                                    break
+                        if match:
+                            result = json.dumps({"id": match.get("id"), "name": match.get("name"), "data": match.get("data", {})})
+                            _starter_template_msg_ids.add(tc["id"])
+                            console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
+                        else:
+                            result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call list_starter_projects first."})
                     else:
                         try:
                             result = await mcp.call_tool(tc["name"], args)
                         except Exception as e:
                             result = f"ERROR: {e}"
+
+                    # Immediately strip template list results — cache full data, send index only to LLM
+                    if tc["name"] in ("list_starter_projects", "get_basic_examples"):
+                        try:
+                            parsed = json.loads(result) if isinstance(result, str) else result
+                            if isinstance(parsed, list):
+                                for t in parsed:
+                                    tid = str(t.get("id", "")).lower()
+                                    tname = str(t.get("name", "")).lower()
+                                    if tid:
+                                        _starter_cache[tid] = t
+                                    if tname:
+                                        _starter_cache[tname] = t
+                                result = json.dumps([
+                                    {"id": t.get("id"), "name": t.get("name"), "description": t.get("description", "")}
+                                    for t in parsed
+                                ])
+                                console.print(f"[dim]↳ template index: {len(parsed)} templates cached, full data stripped from context[/dim]")
+                        except Exception:
+                            pass
 
                     if tc["name"] == "build_flow":
                         _last_build_flow_id = tc["arguments"].get("flow_id")
@@ -251,6 +347,23 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 ])
                         except Exception:
                             pass
+
+                    # After create/update: LLM has consumed template data — strip get_starter_template
+                    # results from message history to reclaim the ~63KB they occupy in every subsequent call
+                    if tc["name"] in ("create_flow", "update_flow") and _starter_template_msg_ids:
+                        for msg in messages:
+                            if msg.get("role") == "tool" and msg.get("tool_call_id") in _starter_template_msg_ids:
+                                try:
+                                    parsed = json.loads(msg["content"])
+                                    if isinstance(parsed, dict):
+                                        msg["content"] = json.dumps({
+                                            "id": parsed.get("id"),
+                                            "name": parsed.get("name"),
+                                            "_note": "full data stripped after use",
+                                        })
+                                except Exception:
+                                    pass
+                        _starter_template_msg_ids.clear()
 
                     # Strip data.node schemas from any tool that returns flow JSON.
                     # create_flow/update_flow return the full updated flow — same schema bloat as get_flow.
@@ -283,8 +396,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     console.print(Markdown(response["content"]))
                 messages.append({"role": "assistant", "content": response["content"]})
                 if prompt_tokens or completion_tokens:
+                    total_elapsed = time.perf_counter() - turn_start
                     console.print(
-                        f"[dim]↑{prompt_tokens:,} ↓{completion_tokens:,} tokens[/dim]"
+                        f"[dim]total: {total_elapsed:.1f}s · ↑{prompt_tokens:,} ↓{completion_tokens:,} tokens[/dim]"
                     )
                 # Trim history to last 2 user turns + this assistant response.
                 # Drops tool call/result messages from prior turns to prevent token explosion.

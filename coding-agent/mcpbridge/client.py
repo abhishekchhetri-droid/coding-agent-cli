@@ -89,7 +89,39 @@ class LangflowMCPClient:
             if isinstance(components, dict):
                 flat.update(components)
         self._component_schema_cache = flat
+        # Invalidate dynamic resolution indexes so they rebuild against new schemas
+        self._schema_lower_index = {}
+        self._schema_display_index = {}
         return flat
+
+    def _resolve_type(self, raw_type: str, schemas: dict) -> str:
+        """Dynamically resolve a type string to the canonical schema key.
+        Tries exact → case-insensitive → display_name match → best prefix match.
+        All resolution is against the live /api/v1/all schema — no static aliases."""
+        if raw_type in schemas:
+            return raw_type
+        lower = raw_type.lower()
+        # Build case-insensitive index and display_name index lazily on first mismatch
+        if not hasattr(self, "_schema_lower_index") or len(self._schema_lower_index) != len(schemas):
+            self._schema_lower_index: dict[str, str] = {}
+            self._schema_display_index: dict[str, str] = {}
+            for key, schema in schemas.items():
+                self._schema_lower_index[key.lower()] = key
+                dn = schema.get("display_name", "")
+                if dn:
+                    self._schema_display_index[dn.lower().replace(" ", "")] = key
+        # 1. Case-insensitive exact match
+        if lower in self._schema_lower_index:
+            return self._schema_lower_index[lower]
+        # 2. Match against display_name (e.g. "Prompt Template" → "PromptTemplate")
+        normalized = lower.replace(" ", "").replace("_", "").replace("-", "")
+        if normalized in self._schema_display_index:
+            return self._schema_display_index[normalized]
+        # 3. Prefix match — find all schema keys that start with or contain the raw_type string
+        candidates = [k for lk, k in self._schema_lower_index.items() if lk.startswith(lower) or lower.startswith(lk)]
+        if len(candidates) == 1:
+            return candidates[0]
+        return raw_type  # unknown — let caller raise
 
     def enrich_nodes(
         self,
@@ -101,9 +133,20 @@ class LangflowMCPClient:
         enriched = []
         for node in nodes:
             node = dict(node)
+            # Note nodes are UI-only annotations; graph builder skips type=="noteNode".
+            # Pass them through unchanged — overwriting their type breaks graph skip logic.
+            if node.get("type") == "noteNode" or node.get("data", {}).get("type") in ("note", "noteNode"):
+                enriched.append(node)
+                continue
             # Prefer data.type — top-level type is "genericNode" for canvas-rendered nodes
-            node_type = node.get("data", {}).get("type") or node.get("type", "")
+            raw_type = node.get("data", {}).get("type") or node.get("type", "")
+            node_type = self._resolve_type(raw_type, schemas)
             data = dict(node.get("data", {}))
+            # Patch data.type to canonical resolved type so edges + credentials match correctly
+            if node_type != raw_type:
+                data["type"] = node_type
+                if isinstance(node.get("data"), dict):
+                    node = dict(node)
             if "node" not in data:
                 if node_type not in schemas:
                     raise ValueError(
@@ -111,6 +154,12 @@ class LangflowMCPClient:
                         f"Call list_components to find the exact 'type' string, then retry."
                     )
                 data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy
+            elif "_type" not in data["node"].get("template", {}):
+                # _type is required by Langflow's graph builder (_create_vertex line 2136).
+                # Template-copied data.node may lack it — inject from live schema if available.
+                schema_tmpl = schemas.get(node_type, {}).get("template", {})
+                if "_type" in schema_tmpl:
+                    data["node"].setdefault("template", {})["_type"] = schema_tmpl["_type"]
             # Inject credentials into template fields
             if credential_overrides and node_type in credential_overrides and "node" in data:
                 tmpl = data["node"].get("template", {})
@@ -295,7 +344,28 @@ class LangflowMCPClient:
                     "required": ["type_name"],
                 },
             },
-        }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_starter_template",
+                "description": (
+                    "Get full nodes[] and edges[] for ONE specific starter template by name or id. "
+                    "Call this AFTER scoring templates from list_starter_projects index to fetch the winning template's full data. "
+                    "Much cheaper than re-calling list_starter_projects — returns only the one template you need."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name_or_id": {
+                            "type": "string",
+                            "description": "Template name (e.g. 'Hybrid RAG Agent') or id from list_starter_projects index"
+                        }
+                    },
+                    "required": ["name_or_id"],
+                },
+            },
+        },
     ]
 
     def get_component_schema(self, type_name: str) -> dict:
