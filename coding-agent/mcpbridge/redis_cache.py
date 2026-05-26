@@ -99,6 +99,31 @@ class RedisEntityCache:
         flows.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         return flows[:limit]
 
+    async def get_starter_data(self, name_or_id: str) -> dict | None:
+        """Look up a starter template by id or partial name. Returns full template dict or None."""
+        if not self._client:
+            return None
+        # Try direct id lookup first
+        raw = await self._client.get(f"lf:starter:data:{name_or_id}")
+        if raw:
+            try:
+                return json.loads(raw)
+            except Exception:
+                return None
+        # Search by name (partial, case-insensitive)
+        ids = await self._client.smembers("lf:starters:ids")
+        q = name_or_id.lower()
+        for sid in ids:
+            meta = await self._client.hgetall(f"lf:starter:{sid}")
+            if meta and q in meta.get("name", "").lower():
+                raw = await self._client.get(f"lf:starter:data:{sid}")
+                if raw:
+                    try:
+                        return json.loads(raw)
+                    except Exception:
+                        pass
+        return None
+
     async def list_all_starters(self) -> list[dict]:
         if not self._client:
             return []
