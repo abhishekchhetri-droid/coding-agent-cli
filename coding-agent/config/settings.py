@@ -35,5 +35,10 @@ class Settings(BaseSettings):
     azure_anthropic_api_key: str = ""
     azure_anthropic_deployment: str = "claude-sonnet-4-6"
 
+    # Redis entity cache
+    redis_url: str = Field(default="", validation_alias="REDIS_URL")
+    redis_sync_interval: int = Field(default=60, validation_alias="REDIS_SYNC_INTERVAL")
+    entity_top_k: int = Field(default=15, validation_alias="ENTITY_TOP_K")
+
     # Agent behaviour
-    max_tool_iterations: int = 10
+    max_tool_iterations: int = 15

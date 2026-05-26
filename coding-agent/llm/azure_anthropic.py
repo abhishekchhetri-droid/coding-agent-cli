@@ -103,8 +103,11 @@ class AzureAnthropicProvider(LLMProvider):
             "messages": anthropic_messages,
         }
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
         if anthropic_tools:
+            anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
             kwargs["tools"] = anthropic_tools
 
         response = await self._client.messages.create(**kwargs)
@@ -128,6 +131,8 @@ class AzureAnthropicProvider(LLMProvider):
                 "prompt_tokens": response.usage.input_tokens,
                 "completion_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+                "cache_creation_tokens": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+                "cache_read_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
             }
 
         return {

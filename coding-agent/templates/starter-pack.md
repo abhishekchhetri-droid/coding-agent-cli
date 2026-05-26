@@ -1,0 +1,30 @@
+Count: 32
+  - Custom Component Generator
+  - Instagram Copywriter
+  - Image Sentiment Analysis
+  - Financial Report Parser
+  - Search agent
+  - Text Sentiment Analysis
+  - SaaS Pricing
+  - Knowledge Base
+  - Sequential Tasks Agents
+  - Research Agent
+  - NVIDIA RTX Remix
+  - Twitter Thread Generator
+  - Market Research
+  - Social Media Agent
+  - Simple Agent
+  - Memory Chatbot
+  - News Aggregator
+  - Hybrid Search RAG
+  - SEO Keyword Generator
+  - Basic Prompt Chaining
+  - Price Deal Finder
+  - YouTube Analysis
+  - Meeting Summary
+  - Pokédex Agent
+  - Document Q&A
+  - Research Translation Loop
+  - Basic Prompting
+  - Portfolio Website Code Generator
+  - Travel Planning Agents

@@ -1,5 +1,7 @@
+import asyncio
 import gzip
 import json
+import logging
 import os
 from contextlib import AsyncExitStack
 from typing import Any
@@ -8,6 +10,9 @@ import urllib.request
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcpbridge.redis_cache import RedisEntityCache
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_text(obj: Any, depth: int = 0) -> str:
@@ -32,7 +37,13 @@ def _extract_text(obj: Any, depth: int = 0) -> str:
 
 
 class LangflowMCPClient:
-    def __init__(self, mcp_path: str, langflow_api_key: str, langflow_base_url: str) -> None:
+    def __init__(
+        self,
+        mcp_path: str,
+        langflow_api_key: str,
+        langflow_base_url: str,
+        redis_cache: RedisEntityCache | None = None,
+    ) -> None:
         self._mcp_path = mcp_path
         self._langflow_api_key = langflow_api_key
         self._langflow_base_url = langflow_base_url.rstrip("/")
@@ -47,6 +58,8 @@ class LangflowMCPClient:
         self._tools_cache: list[Any] = []
         self._exit_stack: AsyncExitStack | None = None
         self._component_schema_cache: dict[str, Any] = {}  # type_name → full schema
+        self._redis_cache = redis_cache
+        self._sync_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
         self._exit_stack = AsyncExitStack()
@@ -72,6 +85,48 @@ class LangflowMCPClient:
         result = await self._session.list_tools()
         self._tools_cache = result.tools
 
+        if self._redis_cache and await self._redis_cache.connect():
+            try:
+                flows_raw = await self._session_call_json("list_flows", {})
+                # get_basic_examples returns full template data (nodes+edges) — always prefer it.
+                # list_starter_projects often returns metadata-only stubs without data.nodes.
+                starters_raw = await self._session_call_json("get_basic_examples", {})
+                if not starters_raw:
+                    starters_raw = await self._session_call_json("list_starter_projects", {})
+                if isinstance(flows_raw, list):
+                    await self._redis_cache.sync_flows(flows_raw)
+                if isinstance(starters_raw, list) and starters_raw:
+                    await self._redis_cache.sync_starters(starters_raw)
+                self._sync_task = asyncio.create_task(self._background_sync())
+            except Exception as e:
+                logger.warning("Redis cold sync failed: %s", e)
+
+    async def _session_call_json(self, tool_name: str, args: dict) -> Any:
+        result = await self._session.call_tool(tool_name, args)
+        if not result.content:
+            return None
+        item = result.content[0]
+        text = item.text if hasattr(item, "text") else str(item)
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+
+    async def _background_sync(self) -> None:
+        while True:
+            await asyncio.sleep(self._redis_cache._sync_interval)
+            try:
+                flows_raw = await self._session_call_json("list_flows", {})
+                starters_raw = await self._session_call_json("get_basic_examples", {})
+                if not starters_raw:
+                    starters_raw = await self._session_call_json("list_starter_projects", {})
+                if isinstance(flows_raw, list):
+                    await self._redis_cache.sync_flows(flows_raw)
+                if isinstance(starters_raw, list) and starters_raw:
+                    await self._redis_cache.sync_starters(starters_raw)
+            except Exception as e:
+                logger.warning("Redis background sync error: %s", e)
+
     def _fetch_component_schemas(self) -> dict[str, Any]:
         """Fetch all component schemas from /api/v1/all. Cached after first call."""
         if self._component_schema_cache:
@@ -89,7 +144,39 @@ class LangflowMCPClient:
             if isinstance(components, dict):
                 flat.update(components)
         self._component_schema_cache = flat
+        # Invalidate dynamic resolution indexes so they rebuild against new schemas
+        self._schema_lower_index = {}
+        self._schema_display_index = {}
         return flat
+
+    def _resolve_type(self, raw_type: str, schemas: dict) -> str:
+        """Dynamically resolve a type string to the canonical schema key.
+        Tries exact → case-insensitive → display_name match → best prefix match.
+        All resolution is against the live /api/v1/all schema — no static aliases."""
+        if raw_type in schemas:
+            return raw_type
+        lower = raw_type.lower()
+        # Build case-insensitive index and display_name index lazily on first mismatch
+        if not hasattr(self, "_schema_lower_index") or len(self._schema_lower_index) != len(schemas):
+            self._schema_lower_index: dict[str, str] = {}
+            self._schema_display_index: dict[str, str] = {}
+            for key, schema in schemas.items():
+                self._schema_lower_index[key.lower()] = key
+                dn = schema.get("display_name", "")
+                if dn:
+                    self._schema_display_index[dn.lower().replace(" ", "")] = key
+        # 1. Case-insensitive exact match
+        if lower in self._schema_lower_index:
+            return self._schema_lower_index[lower]
+        # 2. Match against display_name (e.g. "Prompt Template" → "PromptTemplate")
+        normalized = lower.replace(" ", "").replace("_", "").replace("-", "")
+        if normalized in self._schema_display_index:
+            return self._schema_display_index[normalized]
+        # 3. Prefix match — find all schema keys that start with or contain the raw_type string
+        candidates = [k for lk, k in self._schema_lower_index.items() if lk.startswith(lower) or lower.startswith(lk)]
+        if len(candidates) == 1:
+            return candidates[0]
+        return raw_type  # unknown — let caller raise
 
     def enrich_nodes(
         self,
@@ -101,17 +188,31 @@ class LangflowMCPClient:
         enriched = []
         for node in nodes:
             node = dict(node)
+            # Note nodes are UI-only annotations; graph builder skips type=="noteNode".
+            # Pass them through unchanged — overwriting their type breaks graph skip logic.
+            if node.get("type") == "noteNode" or node.get("data", {}).get("type") in ("note", "noteNode"):
+                enriched.append(node)
+                continue
             # Prefer data.type — top-level type is "genericNode" for canvas-rendered nodes
-            node_type = node.get("data", {}).get("type") or node.get("type", "")
+            raw_type = node.get("data", {}).get("type") or node.get("type", "")
+            # node_type resolves to the /api/v1/all schema key (used for schema lookup only)
+            node_type = self._resolve_type(raw_type, schemas)
             data = dict(node.get("data", {}))
-            if "node" not in data:
-                if node_type not in schemas:
-                    raise ValueError(
-                        f"Unknown component type: {node_type!r}. "
-                        f"Call list_components to find the exact 'type' string, then retry."
-                    )
-                data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy
-            # Inject credentials into template fields
+            if node_type not in schemas:
+                raise ValueError(
+                    f"Unknown component type: {node_type!r}. "
+                    f"Call list_components to find the exact 'type' string, then retry."
+                )
+            # Always use the live schema — template-cloned nodes can carry stale data.node
+            # (missing display_name, empty outputs) which causes the Langflow frontend to show
+            # "undefined" for node names and drop all edges as invalid.
+            # data.type is preserved separately so the canvas renderer stays correct.
+            data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy of live schema
+            # Only patch data.type for fresh nodes — for template nodes data.type is already correct
+            if "node" not in node.get("data", {}):
+                if node_type != raw_type:
+                    data["type"] = node_type
+            # Inject credentials — uses node_type (schema key) to find the right overrides
             if credential_overrides and node_type in credential_overrides and "node" in data:
                 tmpl = data["node"].get("template", {})
                 for field_name, value in credential_overrides[node_type].items():
@@ -120,7 +221,7 @@ class LangflowMCPClient:
                         tmpl[field_name] = {"name": field_name, "type": "str", "value": ""}
                     tmpl[field_name]["value"] = value
             # Ensure data.type and data.id are always set
-            data.setdefault("type", node_type)
+            data.setdefault("type", raw_type)  # preserve original type if not already set
             data.setdefault("id", node.get("id", ""))
             # For nodes with multiple outputs, pin the correct active output so the
             # canvas connects the right handle (e.g. model_output not text_output).
@@ -137,9 +238,15 @@ class LangflowMCPClient:
         return enriched
 
     def _auto_tool_mode(self, nodes: list[dict]) -> None:
-        """Enable tool_mode on non-native-tool nodes that expose a tool-eligible output.
-        Skips tool CONSUMERS (nodes with a 'tools' input, e.g. Agent) — they must never
-        have tool_mode enabled or their Toolset handle renders instead of the tools input."""
+        """Enable tool_mode on components that declare tool-capable inputs.
+
+        In Langflow, tool capability is declared on INPUT fields (tool_mode=True on
+        MessageTextInput, etc.), not on output fields. Components like CalculatorComponent
+        and URLComponent declare tool_mode on their inputs — that is the canonical signal
+        that the component supports being wrapped as a StructuredTool.
+
+        Skips tool CONSUMERS (nodes with a 'tools' input, e.g. Agent) and native tool
+        nodes (already have api_build_tool output)."""
         for node in nodes:
             d = node.get("data", {})
             schema = d.get("node", {})
@@ -149,10 +256,121 @@ class LangflowMCPClient:
             if "tools" in schema.get("template", {}):
                 continue
             outputs = schema.get("outputs", [])
-            has_native_tool = any(o.get("name") == "api_build_tool" for o in outputs)
-            has_tool_eligible = any(o.get("tool_mode") for o in outputs)
-            if not has_native_tool and has_tool_eligible:
+            # Both api_build_tool (older Langflow) and component_as_tool (current) signal native tool
+            has_native_tool = any(o.get("name") in ("api_build_tool", "component_as_tool") for o in outputs)
+            if has_native_tool:
+                continue  # already a native tool, no wrapping needed
+            # Detect tool capability from INPUT fields — this is where Langflow components
+            # declare tool_mode support (e.g., expression/urls inputs with tool_mode=True)
+            tmpl = schema.get("template", {})
+            has_tool_input = any(
+                isinstance(v, dict) and v.get("tool_mode")
+                for v in tmpl.values()
+            )
+            if has_tool_input:
                 schema["tool_mode"] = True
+                # Inject component_as_tool output — the exact schema Langflow uses for
+                # tool-wrapped components (to_toolkit method). Without this, enrich_edges
+                # and ensure_tool_edges can't find the tool output after enrich_nodes
+                # overwrites data.node with the pre-tool_mode schema from /api/v1/all.
+                outputs = schema.setdefault("outputs", [])
+                if not any(o.get("name") == "component_as_tool" for o in outputs):
+                    outputs.append({
+                        "allows_loop": False,
+                        "cache": True,
+                        "display_name": "Toolset",
+                        "group_outputs": False,
+                        "hidden": None,
+                        "loop_types": None,
+                        "method": "to_toolkit",
+                        "name": "component_as_tool",
+                        "options": None,
+                        "required_inputs": None,
+                        "selected": "Tool",
+                        "tool_mode": True,
+                        "types": ["Tool"],
+                        "value": "__UNDEFINED__",
+                    })
+                # Set selected_output so Langflow's frontend uses component_as_tool handle
+                d["selected_output"] = "component_as_tool"
+                # Inject tools_metadata into template — Langflow's backend requires this
+                # field to validate tool-mode edges for non-native tool components.
+                # Without it, Langflow strips component_as_tool→Agent.tools edges on save/load.
+                # CalculatorComponent has this natively; URLComponent and others don't.
+                if "tools_metadata" not in tmpl:
+                    tool_inputs = [
+                        (k, v) for k, v in tmpl.items()
+                        if isinstance(v, dict) and v.get("tool_mode") and k != "_type"
+                    ]
+                    args: dict = {}
+                    for input_name, input_cfg in tool_inputs:
+                        if input_cfg.get("list"):
+                            args[input_name] = {
+                                "default": "",
+                                "description": input_cfg.get("info", ""),
+                                "items": {"type": "string"},
+                                "title": (input_cfg.get("display_name") or input_name).title(),
+                                "type": "array",
+                            }
+                        else:
+                            args[input_name] = {
+                                "default": input_cfg.get("value", ""),
+                                "description": input_cfg.get("info", ""),
+                                "title": (input_cfg.get("display_name") or input_name).title(),
+                                "type": "string",
+                            }
+                    tool_method = next(
+                        (o.get("method", "") for o in outputs if o.get("method") and o.get("name") not in ("component_as_tool", "api_build_tool")),
+                        (schema.get("display_name") or "tool").lower().replace(" ", "_"),
+                    )
+                    tmpl["tools_metadata"] = {
+                        "_input_type": "ToolsInput",
+                        "advanced": False,
+                        "display_name": "Actions",
+                        "dynamic": False,
+                        "info": "Modify tool names and descriptions to help agents understand when to use each tool.",
+                        "is_list": True,
+                        "list_add_label": "Add More",
+                        "name": "tools_metadata",
+                        "override_skip": False,
+                        "placeholder": "",
+                        "real_time_refresh": True,
+                        "required": False,
+                        "show": True,
+                        "title_case": False,
+                        "tool_mode": False,
+                        "trace_as_metadata": True,
+                        "track_in_telemetry": False,
+                        "type": "tools",
+                        "value": [{
+                            "args": args,
+                            "description": schema.get("description", ""),
+                            "display_description": schema.get("description", ""),
+                            "display_name": tool_method,
+                            "name": tool_method,
+                            "readonly": False,
+                            "status": True,
+                            "tags": [tool_method],
+                        }],
+                    }
+
+    @staticmethod
+    def _parse_handle(handle: Any) -> dict:
+        """Normalize edge handles to dict.
+        Template-cloned edges store handles as JSON strings or œ-encoded strings.
+        LLM-generated edges use plain dicts. Normalize all to dict for uniform processing."""
+        if isinstance(handle, dict):
+            return handle
+        if isinstance(handle, str):
+            try:
+                return json.loads(handle.replace('œ', '"'))
+            except Exception:
+                return {}
+        return {}
+
+    # Structural/base nodes that must never be used as tools.
+    # These are architectural invariants, not use-case hacks.
+    _NEVER_TOOL: set[str] = {"AzureOpenAIModel", "AnthropicModel", "ChatInput", "ChatOutput", "Agent"}
 
     def enrich_edges(self, edges: list[dict], nodes: list[dict]) -> list[dict]:
         """Serialize edge handles as JSON strings, add IDs, and fix targetHandle.type
@@ -174,50 +392,64 @@ class LangflowMCPClient:
         result = []
         for i, edge in enumerate(edges):
             edge = dict(edge)
-            sh = edge.get("sourceHandle", {})
-            th = edge.get("targetHandle", {})
+            # Normalize handles to dicts regardless of source format.
+            # Template edges arrive as JSON strings; LLM edges as dicts.
+            sh = self._parse_handle(edge.get("sourceHandle", {}))
+            th = self._parse_handle(edge.get("targetHandle", {}))
 
             # Fix targetHandle.type from schema
-            if isinstance(th, dict):
-                th = dict(th)
-                tgt_node_id = edge.get("target", "")
-                tgt_comp_type = node_type_map.get(tgt_node_id, "")
-                field_name = th.get("fieldName", "")
-                if tgt_comp_type and field_name and tgt_comp_type in schemas:
-                    tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
-                    actual_type = tmpl_field.get("type")
-                    if actual_type:
-                        th["type"] = actual_type
+            th = dict(th)
+            tgt_node_id = edge.get("target", "")
+            tgt_comp_type = node_type_map.get(tgt_node_id, "")
+            field_name = th.get("fieldName", "")
+            if tgt_comp_type and field_name and tgt_comp_type in schemas:
+                tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
+                actual_type = tmpl_field.get("type")
+                if actual_type:
+                    th["type"] = actual_type
 
-            # Rewrite sourceHandle for tool-mode connections to Agent.tools
-            if (
-                isinstance(sh, dict)
-                and isinstance(th, dict)
-                and th.get("fieldName") == "tools"
-                and sh.get("name") in (None, "", "api_build_tool")
-            ):
+            # Rewrite sourceHandle for ALL tool edges (fieldName=="tools").
+            # Runs regardless of tool_mode state — template clones, LLM-created edges, native tools.
+            # Detection is fully schema-driven (no component name hardcoding):
+            #   priority 1: native api_build_tool output (CalculatorTool, SearchAPI, WikipediaAPI, ...)
+            #   priority 2: output with tool_mode:true in schema (URLComponent.page_results, ...)
+            #   priority 3: fallback — enable tool_mode, Langflow framework wraps primary output
+            # _NEVER_TOOL: structural nodes that must never be treated as tools; wrong edges from
+            # LLM hallucination are left unrewritten so Langflow drops them cleanly.
+            if th.get("fieldName") == "tools":
                 src_node = node_by_id.get(edge.get("source", ""))
                 if src_node:
+                    src_type = src_node.get("data", {}).get("type", "")
                     src_schema = src_node.get("data", {}).get("node", {})
-                    if src_schema.get("tool_mode"):
-                        outputs = src_schema.get("outputs", [])
-                        # Prefer an output explicitly flagged tool_mode=True;
-                        # fall back to first output (Langflow wraps it as Tool when tool_mode is on).
-                        tool_out = next(
-                            (o for o in outputs if o.get("tool_mode")),
-                            outputs[0] if outputs else None,
+                    outputs = src_schema.get("outputs", [])
+                    if src_type not in self._NEVER_TOOL:
+                        # Priority 1: native tool output (api_build_tool or component_as_tool)
+                        native_out = next(
+                            (o for o in outputs if o.get("name") in ("api_build_tool", "component_as_tool")),
+                            None,
                         )
-                        if tool_out:
+                        if native_out:
                             sh = dict(sh)
-                            sh["name"] = tool_out.get("name", sh.get("name", ""))
+                            sh["name"] = native_out["name"]
                             sh["output_types"] = ["Tool"]
+                        else:
+                            tool_out = next((o for o in outputs if o.get("tool_mode")), None)
+                            if tool_out:
+                                # Priority 2: any output with tool_mode=True in schema
+                                sh = dict(sh)
+                                sh["name"] = tool_out.get("name", "component_as_tool")
+                                sh["output_types"] = ["Tool"]
+                            else:
+                                # Priority 3: fallback — enable tool_mode, use component_as_tool
+                                src_schema["tool_mode"] = True
+                                sh = dict(sh)
+                                sh["name"] = "component_as_tool"
+                                sh["output_types"] = ["Tool"]
 
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
             # JSON.stringify(obj).replace(/"/g, "œ")) — sun() validation requires this format.
-            if isinstance(sh, dict):
-                edge["sourceHandle"] = json.dumps(sh).replace('"', 'œ')
-            if isinstance(th, dict):
-                edge["targetHandle"] = json.dumps(th).replace('"', 'œ')
+            edge["sourceHandle"] = json.dumps(sh).replace('"', 'œ')
+            edge["targetHandle"] = json.dumps(th).replace('"', 'œ')
 
             # Ensure unique edge ID
             if "id" not in edge:
@@ -233,6 +465,115 @@ class LangflowMCPClient:
 
             result.append(edge)
         return result
+
+    def ensure_tool_edges(self, nodes: list[dict], edges: list[dict]) -> list[dict]:
+        """Auto-add missing Tool→Agent.tools edges when tool-capable nodes have no connection.
+
+        Called after enrich_nodes (which sets tool_mode) and before enrich_edges (which
+        serializes handles). Detects any enriched node with tool_mode=True that lacks an
+        edge to an Agent's tools input, and synthesizes the missing connections.
+        """
+        agent_nodes = [
+            n for n in nodes
+            if "tools" in n.get("data", {}).get("node", {}).get("template", {})
+        ]
+        # Detect tool-capable nodes: tool_mode=True OR has component_as_tool/api_build_tool output
+        tool_nodes = [
+            n for n in nodes
+            if n.get("data", {}).get("node", {}).get("tool_mode")
+            or any(
+                o.get("name") in ("api_build_tool", "component_as_tool")
+                for o in n.get("data", {}).get("node", {}).get("outputs", [])
+            )
+        ]
+        if not agent_nodes or not tool_nodes:
+            return edges
+
+        # Track existing tool-edge pairs (source_id, target_id)
+        existing: set[tuple[str, str]] = set()
+        for e in edges:
+            th_raw = e.get("targetHandle", {})
+            if isinstance(th_raw, str):
+                try:
+                    th = json.loads(th_raw.replace("œ", '"'))
+                except Exception:
+                    th = {}
+            else:
+                th = th_raw
+            if isinstance(th, dict) and th.get("fieldName") == "tools":
+                existing.add((e.get("source", ""), e.get("target", "")))
+
+        new_edges = list(edges)
+        for agent_node in agent_nodes:
+            agent_id = agent_node.get("id", "")
+            agent_type = agent_node.get("data", {}).get("type", "Agent")
+            for tool_node in tool_nodes:
+                tool_id = tool_node.get("id", "")
+                if (tool_id, agent_id) in existing:
+                    continue
+                tool_comp_type = tool_node.get("data", {}).get("type", "")
+                outputs = tool_node.get("data", {}).get("node", {}).get("outputs", [])
+                # Priority: component_as_tool/api_build_tool (native) → tool_mode output → fallback
+                tool_out = (
+                    next((o for o in outputs if o.get("name") in ("component_as_tool", "api_build_tool")), None)
+                    or next((o for o in outputs if o.get("tool_mode")), None)
+                )
+                if not tool_out:
+                    continue
+                new_edges.append({
+                    "source": tool_id,
+                    "target": agent_id,
+                    "sourceHandle": {
+                        "dataType": tool_comp_type,
+                        "id": tool_id,
+                        "name": tool_out.get("name", "component_as_tool"),
+                        "output_types": ["Tool"],
+                    },
+                    "targetHandle": {
+                        "fieldName": "tools",
+                        "id": agent_id,
+                        "inputTypes": ["Tool"],
+                        "type": "other",
+                    },
+                })
+                existing.add((tool_id, agent_id))
+        return new_edges
+
+    async def fetch_starter(self, name_or_id: str) -> dict | None:
+        """Look up a starter template by name or id. Checks Redis first, then HTTP."""
+        key = name_or_id.strip()
+        if self._redis_cache:
+            data = await self._redis_cache.get_starter_data(key)
+            if data:
+                return data
+        # HTTP fallback: GET /api/v1/flows/basic_examples/
+        url = f"{self._langflow_base_url}/api/v1/flows/basic_examples/"
+        req = urllib.request.Request(url, headers={"x-api-key": self._langflow_api_key})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                starters = json.loads(resp.read())
+            q = key.lower()
+            match = next(
+                (s for s in starters if s.get("id") == key or q in s.get("name", "").lower()),
+                None,
+            )
+            if match and self._redis_cache:
+                await self._redis_cache.sync_starters(starters)
+            return match
+        except Exception as e:
+            logger.warning("fetch_starter HTTP fallback failed: %s", e)
+            return None
+
+    def _create_flow_direct(self, name: str, description: str, data: dict) -> dict:
+        """POST a complete flow directly to /api/v1/flows/. Bypasses MCP."""
+        url = f"{self._langflow_base_url}/api/v1/flows/"
+        payload = json.dumps({"name": name, "description": description, "data": data}).encode()
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"x-api-key": self._langflow_api_key, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
 
     def test_run_flow(self, flow_id: str, input_value: str = "2+2") -> dict:
         """POST to /api/v1/run/{flow_id} with dummy input. Returns {ok, answer, error}."""
@@ -269,12 +610,51 @@ class LangflowMCPClient:
 
     _CORE_TOOLS = {
         "create_flow", "update_flow", "get_flow", "list_flows", "delete_flow",
-        "build_flow", "get_build_status", "run_flow",
+        "build_flow", "run_flow",
         "list_components", "list_variables", "list_folders",
         "get_basic_examples", "list_starter_projects", "health_check",
     }
 
     _VIRTUAL_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "clone_starter_template",
+                "description": (
+                    "Clone a starter template into a new flow server-side — "
+                    "no need to call get_basic_examples, get_starter_template, or create_flow. "
+                    "Use for Score ≥ 8.5 direct clones. "
+                    "Returns {flow_id, name, node_count, edge_count}."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name_or_id": {"type": "string", "description": "Template name (e.g. 'Simple Agent') or id"},
+                        "name": {"type": "string", "description": "Name for the new flow (defaults to template name)"},
+                        "description": {"type": "string", "description": "Description for the new flow"},
+                    },
+                    "required": ["name_or_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_flows",
+                "description": (
+                    "Search user flows by keyword. Returns [{id, name, description}] for matching flows. "
+                    "Use instead of list_flows when looking for a specific flow by name or topic."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Keyword to search flow names and descriptions"},
+                        "limit": {"type": "integer", "default": 15},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -295,7 +675,28 @@ class LangflowMCPClient:
                     "required": ["type_name"],
                 },
             },
-        }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_starter_template",
+                "description": (
+                    "Get full nodes[] and edges[] for ONE specific starter template by name or id. "
+                    "Call this AFTER scoring templates from list_starter_projects index to fetch the winning template's full data. "
+                    "Much cheaper than re-calling list_starter_projects — returns only the one template you need."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name_or_id": {
+                            "type": "string",
+                            "description": "Template name (e.g. 'Hybrid RAG Agent') or id from list_starter_projects index"
+                        }
+                    },
+                    "required": ["name_or_id"],
+                },
+            },
+        },
     ]
 
     def get_component_schema(self, type_name: str) -> dict:
@@ -346,7 +747,54 @@ class LangflowMCPClient:
     async def call_tool(self, name: str, arguments: dict) -> Any:
         if self._session is None:
             raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        # search_flows virtual tool
+        if name == "search_flows":
+            query = arguments.get("query", "")
+            limit = arguments.get("limit", 15)
+            if self._redis_cache and await self._redis_cache.is_warm():
+                results = await self._redis_cache.search_flows(query, limit)
+                return json.dumps(results)
+            # Fallback: MCP list_flows then filter
+            all_flows = await self._session_call_json("list_flows", {})
+            if isinstance(all_flows, list):
+                q = query.lower()
+                filtered = [
+                    {"id": f.get("id"), "name": f.get("name", ""), "description": f.get("description", "")}
+                    for f in all_flows
+                    if q in f.get("name", "").lower() or q in (f.get("description") or "").lower()
+                ]
+                return json.dumps(filtered[:limit])
+            return json.dumps([])
+
+        # Redis-cached list_flows
+        if name == "list_flows" and self._redis_cache:
+            if await self._redis_cache.is_warm():
+                flows = await self._redis_cache.list_all_flows()
+                return json.dumps(flows)
+
+        # Redis-cached list_starter_projects
+        if name == "list_starter_projects" and self._redis_cache:
+            if await self._redis_cache.is_warm():
+                starters = await self._redis_cache.list_all_starters()
+                return json.dumps(starters)
+
         result = await self._session.call_tool(name, arguments)
+
+        # Lazy populate Redis on first MCP call when cold
+        if name in ("list_flows", "list_starter_projects") and self._redis_cache and result.content:
+            item0 = result.content[0]
+            raw_text = item0.text if hasattr(item0, "text") else str(item0)
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, list):
+                    if name == "list_flows":
+                        await self._redis_cache.sync_flows(parsed)
+                    else:
+                        await self._redis_cache.sync_starters(parsed)
+            except Exception:
+                pass
+
         if not result.content:
             return None
         item = result.content[0]
@@ -355,6 +803,11 @@ class LangflowMCPClient:
         return str(item)
 
     async def close(self) -> None:
+        if self._sync_task:
+            self._sync_task.cancel()
+            self._sync_task = None
+        if self._redis_cache:
+            await self._redis_cache.close()
         if self._exit_stack:
             try:
                 await self._exit_stack.aclose()
