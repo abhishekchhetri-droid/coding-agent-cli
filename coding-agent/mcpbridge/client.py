@@ -268,17 +268,6 @@ class LangflowMCPClient:
             )
             if has_tool_input:
                 schema["tool_mode"] = True
-                # Add api_build_tool output explicitly — frontend needs it present in the outputs
-                # list to render the connection handle on flow load without a toggle interaction.
-                outputs = schema.setdefault("outputs", [])
-                if not any(o.get("name") == "api_build_tool" for o in outputs):
-                    outputs.append({
-                        "name": "api_build_tool",
-                        "display_name": "Toolset",
-                        "method": "to_toolkit",
-                        "output_types": ["Tool"],
-                        "tool_mode": True,
-                    })
 
     @staticmethod
     def _parse_handle(handle: Any) -> dict:
@@ -364,15 +353,6 @@ class LangflowMCPClient:
                             else:
                                 # Generic wrapper — enable tool_mode, Langflow exposes api_build_tool handle
                                 src_schema["tool_mode"] = True
-                                outputs = src_schema.setdefault("outputs", [])
-                                if not any(o.get("name") == "api_build_tool" for o in outputs):
-                                    outputs.append({
-                                        "name": "api_build_tool",
-                                        "display_name": "Toolset",
-                                        "method": "to_toolkit",
-                                        "output_types": ["Tool"],
-                                        "tool_mode": True,
-                                    })
                                 sh = dict(sh)
                                 sh["name"] = "api_build_tool"
                                 sh["output_types"] = ["Tool"]
