@@ -138,6 +138,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
     messages: list[dict] = []
     _starter_cache: dict[str, dict] = {}  # name_lower/id → full template dict
 
+    def _is_langmodel_node(n: dict) -> bool:
+        return any(
+            "LanguageModel" in (o.get("types") or o.get("output_types") or [])
+            for o in n.get("data", {}).get("node", {}).get("outputs", [])
+        )
+
     console.print(Panel(
         "[bold green]Langflow Coding Agent[/bold green]\n"
         "Type your request. Ctrl+C or 'exit' to quit.",
@@ -336,6 +342,31 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     result = json.dumps({"error": "Template has no nodes."})
                                 else:
                                     tdata["nodes"] = mcp.enrich_nodes(tdata["nodes"], credential_overrides=_credential_overrides)
+                                    # Replace non-Azure LLM nodes with AzureOpenAIModel
+                                    llm_nodes = [n for n in tdata["nodes"] if _is_langmodel_node(n)]
+                                    azure_llm = next((n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"), None)
+                                    if not azure_llm and llm_nodes:
+                                        remove_ids = {n.get("id", "") for n in llm_nodes}
+                                        removed_pos = next(
+                                            (n.get("position", {"x": 250, "y": 200}) for n in llm_nodes),
+                                            {"x": 250, "y": 200},
+                                        )
+                                        tdata["nodes"] = [n for n in tdata["nodes"] if n.get("id", "") not in remove_ids]
+                                        tdata["edges"] = [
+                                            e for e in tdata.get("edges", [])
+                                            if e.get("source") not in remove_ids and e.get("target") not in remove_ids
+                                        ]
+                                        azure_stub = [{"id": "AzureOpenAIModel-1", "type": "AzureOpenAIModel", "position": removed_pos, "data": {"type": "AzureOpenAIModel", "id": "AzureOpenAIModel-1"}}]
+                                        tdata["nodes"].extend(mcp.enrich_nodes(azure_stub, credential_overrides=_credential_overrides))
+                                        agent_ns = [n for n in tdata["nodes"] if "tools" in n.get("data", {}).get("node", {}).get("template", {})]
+                                        for agent_n in agent_ns:
+                                            tdata["edges"].append({
+                                                "source": "AzureOpenAIModel-1",
+                                                "target": agent_n.get("id"),
+                                                "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                                "targetHandle": {"fieldName": "model", "id": agent_n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
+                                            })
+                                        console.print("[dim]↳ swapped template LLM → AzureOpenAIModel[/dim]")
                                     tdata["edges"] = mcp.ensure_tool_edges(tdata["nodes"], tdata.get("edges", []))
                                     tdata["edges"] = mcp.enrich_edges(tdata["edges"], tdata["nodes"])
                                     created = mcp._create_flow_direct(

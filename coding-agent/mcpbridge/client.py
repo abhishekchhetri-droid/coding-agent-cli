@@ -88,10 +88,11 @@ class LangflowMCPClient:
         if self._redis_cache and await self._redis_cache.connect():
             try:
                 flows_raw = await self._session_call_json("list_flows", {})
-                starters_raw = await self._session_call_json("list_starter_projects", {})
-                # list_starter_projects returns empty on many Langflow instances — fall back to basic examples
+                # get_basic_examples returns full template data (nodes+edges) — always prefer it.
+                # list_starter_projects often returns metadata-only stubs without data.nodes.
+                starters_raw = await self._session_call_json("get_basic_examples", {})
                 if not starters_raw:
-                    starters_raw = await self._session_call_json("get_basic_examples", {})
+                    starters_raw = await self._session_call_json("list_starter_projects", {})
                 if isinstance(flows_raw, list):
                     await self._redis_cache.sync_flows(flows_raw)
                 if isinstance(starters_raw, list) and starters_raw:
@@ -116,10 +117,12 @@ class LangflowMCPClient:
             await asyncio.sleep(self._redis_cache._sync_interval)
             try:
                 flows_raw = await self._session_call_json("list_flows", {})
-                starters_raw = await self._session_call_json("list_starter_projects", {})
+                starters_raw = await self._session_call_json("get_basic_examples", {})
+                if not starters_raw:
+                    starters_raw = await self._session_call_json("list_starter_projects", {})
                 if isinstance(flows_raw, list):
                     await self._redis_cache.sync_flows(flows_raw)
-                if isinstance(starters_raw, list):
+                if isinstance(starters_raw, list) and starters_raw:
                     await self._redis_cache.sync_starters(starters_raw)
             except Exception as e:
                 logger.warning("Redis background sync error: %s", e)
@@ -235,9 +238,15 @@ class LangflowMCPClient:
         return enriched
 
     def _auto_tool_mode(self, nodes: list[dict]) -> None:
-        """Enable tool_mode on non-native-tool nodes that expose a tool-eligible output.
-        Skips tool CONSUMERS (nodes with a 'tools' input, e.g. Agent) — they must never
-        have tool_mode enabled or their Toolset handle renders instead of the tools input."""
+        """Enable tool_mode on components that declare tool-capable inputs.
+
+        In Langflow, tool capability is declared on INPUT fields (tool_mode=True on
+        MessageTextInput, etc.), not on output fields. Components like CalculatorComponent
+        and URLComponent declare tool_mode on their inputs — that is the canonical signal
+        that the component supports being wrapped as a StructuredTool.
+
+        Skips tool CONSUMERS (nodes with a 'tools' input, e.g. Agent) and native tool
+        nodes (already have api_build_tool output)."""
         for node in nodes:
             d = node.get("data", {})
             schema = d.get("node", {})
@@ -248,9 +257,28 @@ class LangflowMCPClient:
                 continue
             outputs = schema.get("outputs", [])
             has_native_tool = any(o.get("name") == "api_build_tool" for o in outputs)
-            has_tool_eligible = any(o.get("tool_mode") for o in outputs)
-            if not has_native_tool and has_tool_eligible:
+            if has_native_tool:
+                continue  # already a native tool, no wrapping needed
+            # Detect tool capability from INPUT fields — this is where Langflow components
+            # declare tool_mode support (e.g., expression/urls inputs with tool_mode=True)
+            tmpl = schema.get("template", {})
+            has_tool_input = any(
+                isinstance(v, dict) and v.get("tool_mode")
+                for v in tmpl.values()
+            )
+            if has_tool_input:
                 schema["tool_mode"] = True
+                # Add api_build_tool output explicitly — frontend needs it present in the outputs
+                # list to render the connection handle on flow load without a toggle interaction.
+                outputs = schema.setdefault("outputs", [])
+                if not any(o.get("name") == "api_build_tool" for o in outputs):
+                    outputs.append({
+                        "name": "api_build_tool",
+                        "display_name": "Toolset",
+                        "method": "to_toolkit",
+                        "output_types": ["Tool"],
+                        "tool_mode": True,
+                    })
 
     @staticmethod
     def _parse_handle(handle: Any) -> dict:
@@ -328,15 +356,25 @@ class LangflowMCPClient:
                             sh["output_types"] = ["Tool"]
                         else:
                             tool_out = next((o for o in outputs if o.get("tool_mode")), None)
-                            if not tool_out:
-                                # No explicit tool output — enable tool_mode so Langflow wraps it
-                                src_schema["tool_mode"] = True
-                                tool_out = next(
-                                    (o for o in outputs if o.get("name") == "component_as_tool"), None
-                                )
                             if tool_out:
+                                # Explicit tool-mode output declared in schema (URLComponent.page_results etc.)
                                 sh = dict(sh)
                                 sh["name"] = tool_out.get("name", "api_build_tool")
+                                sh["output_types"] = ["Tool"]
+                            else:
+                                # Generic wrapper — enable tool_mode, Langflow exposes api_build_tool handle
+                                src_schema["tool_mode"] = True
+                                outputs = src_schema.setdefault("outputs", [])
+                                if not any(o.get("name") == "api_build_tool" for o in outputs):
+                                    outputs.append({
+                                        "name": "api_build_tool",
+                                        "display_name": "Toolset",
+                                        "method": "to_toolkit",
+                                        "output_types": ["Tool"],
+                                        "tool_mode": True,
+                                    })
+                                sh = dict(sh)
+                                sh["name"] = "api_build_tool"
                                 sh["output_types"] = ["Tool"]
 
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
