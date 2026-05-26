@@ -148,7 +148,7 @@ targetHandle: {"fieldName": "tools", "id": "Agent-1", "inputTypes": ["Tool"], "t
 ## After Create/Update
 
 1. `build_flow` → `get_flow` (agent layer auto-runs verification)
-2. ✅ VERIFIED → report success
+2. ✅ VERIFIED → one line only: "✅ Flow ready — `<flow_id>`". Nothing else. No tables, no diagrams, no usage examples.
 3. ⚠ 0 nodes → wrong type name, call list_components, fix and retry
 4. ⚠ EXECUTION FAILED → read error, fix credentials/wiring/config, update + rebuild
 
