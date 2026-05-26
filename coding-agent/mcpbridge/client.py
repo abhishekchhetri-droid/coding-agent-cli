@@ -291,6 +291,68 @@ class LangflowMCPClient:
                         "types": ["Tool"],
                         "value": "__UNDEFINED__",
                     })
+                # Set selected_output so Langflow's frontend uses component_as_tool handle
+                d["selected_output"] = "component_as_tool"
+                # Inject tools_metadata into template — Langflow's backend requires this
+                # field to validate tool-mode edges for non-native tool components.
+                # Without it, Langflow strips component_as_tool→Agent.tools edges on save/load.
+                # CalculatorComponent has this natively; URLComponent and others don't.
+                if "tools_metadata" not in tmpl:
+                    tool_inputs = [
+                        (k, v) for k, v in tmpl.items()
+                        if isinstance(v, dict) and v.get("tool_mode") and k != "_type"
+                    ]
+                    args: dict = {}
+                    for input_name, input_cfg in tool_inputs:
+                        if input_cfg.get("list"):
+                            args[input_name] = {
+                                "default": "",
+                                "description": input_cfg.get("info", ""),
+                                "items": {"type": "string"},
+                                "title": (input_cfg.get("display_name") or input_name).title(),
+                                "type": "array",
+                            }
+                        else:
+                            args[input_name] = {
+                                "default": input_cfg.get("value", ""),
+                                "description": input_cfg.get("info", ""),
+                                "title": (input_cfg.get("display_name") or input_name).title(),
+                                "type": "string",
+                            }
+                    tool_method = next(
+                        (o.get("method", "") for o in outputs if o.get("method") and o.get("name") not in ("component_as_tool", "api_build_tool")),
+                        (schema.get("display_name") or "tool").lower().replace(" ", "_"),
+                    )
+                    tmpl["tools_metadata"] = {
+                        "_input_type": "ToolsInput",
+                        "advanced": False,
+                        "display_name": "Actions",
+                        "dynamic": False,
+                        "info": "Modify tool names and descriptions to help agents understand when to use each tool.",
+                        "is_list": True,
+                        "list_add_label": "Add More",
+                        "name": "tools_metadata",
+                        "override_skip": False,
+                        "placeholder": "",
+                        "real_time_refresh": True,
+                        "required": False,
+                        "show": True,
+                        "title_case": False,
+                        "tool_mode": False,
+                        "trace_as_metadata": True,
+                        "track_in_telemetry": False,
+                        "type": "tools",
+                        "value": [{
+                            "args": args,
+                            "description": schema.get("description", ""),
+                            "display_description": schema.get("description", ""),
+                            "display_name": tool_method,
+                            "name": tool_method,
+                            "readonly": False,
+                            "status": True,
+                            "tags": [tool_method],
+                        }],
+                    }
 
     @staticmethod
     def _parse_handle(handle: Any) -> dict:
