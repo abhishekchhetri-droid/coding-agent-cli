@@ -360,7 +360,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                             "targetHandle": {"fieldName": "input_value", "id": _co.get("id"), "inputTypes": ["Data", "JSON", "DataFrame", "Table", "Message"], "type": "other"},
                                         })
                                     console.print("[dim]↳ injected Agent + wired ChatInput→Agent→ChatOutput[/dim]")
-                                elif len(llm_nodes) > 1:
+                                if azure_llm and len(llm_nodes) > 1:
                                     extra_llm_ids = {n.get("id", "") for n in llm_nodes if n is not azure_llm}
                                     data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in extra_llm_ids]
                                     data["edges"] = [
