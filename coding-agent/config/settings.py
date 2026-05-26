@@ -41,4 +41,4 @@ class Settings(BaseSettings):
     entity_top_k: int = Field(default=15, validation_alias="ENTITY_TOP_K")
 
     # Agent behaviour
-    max_tool_iterations: int = 10
+    max_tool_iterations: int = 15

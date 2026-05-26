@@ -147,10 +147,11 @@ targetHandle: {"fieldName": "tools", "id": "Agent-1", "inputTypes": ["Tool"], "t
 
 ## After Create/Update
 
-1. `build_flow` → `get_flow` (agent layer auto-runs verification)
-2. ✅ VERIFIED → one line only: "✅ Flow ready — `<flow_id>`". Nothing else. No tables, no diagrams, no usage examples.
-3. ⚠ 0 nodes → wrong type name, call list_components, fix and retry
-4. ⚠ EXECUTION FAILED → read error, fix credentials/wiring/config, update + rebuild
+1. Call `build_flow`. **Do NOT call `get_build_status` — it is broken and will always error.**
+2. After `build_flow` returns, call `get_flow` immediately — the agent layer runs verification automatically.
+3. ✅ VERIFIED → one line only: "✅ Flow ready — `<flow_id>`". Nothing else. No tables, no diagrams, no usage examples.
+4. ⚠ 0 nodes → wrong type name, call list_components, fix and retry
+5. ⚠ EXECUTION FAILED → read error, fix credentials/wiring/config, update + rebuild
 
 Never report success without ✅ VERIFIED.
 Flow IDs come from API responses only — never fabricate.

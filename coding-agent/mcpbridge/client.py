@@ -426,7 +426,7 @@ class LangflowMCPClient:
 
     _CORE_TOOLS = {
         "create_flow", "update_flow", "get_flow", "list_flows", "delete_flow",
-        "build_flow", "get_build_status", "run_flow",
+        "build_flow", "run_flow",
         "list_components", "list_variables", "list_folders",
         "get_basic_examples", "list_starter_projects", "health_check",
     }
