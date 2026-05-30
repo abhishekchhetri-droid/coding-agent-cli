@@ -804,6 +804,39 @@ class LangflowMCPClient:
         {
             "type": "function",
             "function": {
+                "name": "delete_node",
+                "description": (
+                    "Remove one or more nodes from a flow in a single round-trip. "
+                    "Fetches the flow, drops matched nodes + any edges referencing them, "
+                    "and PATCHes the result. Use this for 'remove X' / 'delete X' user requests "
+                    "instead of update_flow — update_flow's merge semantics can only ADD, "
+                    "never remove, so a delete via update_flow silently no-ops. "
+                    "Pass node_ids (exact IDs from get_flow) OR types (e.g. 'CalculatorComponent', "
+                    "'URLComponent'); type→ID resolution happens server-side. "
+                    "Returns {flow_id, removed_node_ids, removed_edge_count}."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "flow_id": {"type": "string", "description": "Flow UUID"},
+                        "node_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exact node IDs to delete (preferred when known)",
+                        },
+                        "types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Component types — every node of these types is removed",
+                        },
+                    },
+                    "required": ["flow_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "get_starter_template",
                 "description": (
                     "Get full nodes[] and edges[] for ONE specific starter template by name or id. "
@@ -869,9 +902,61 @@ class LangflowMCPClient:
             if t.name in self._CORE_TOOLS
         ] + self._VIRTUAL_TOOLS
 
+    async def _handle_delete_node(self, args: dict) -> str:
+        """Server-side node removal: get_flow → drop matched nodes + dangling edges → PATCH.
+        Bypasses agent merge logic (which is union-only and cannot remove)."""
+        flow_id = args.get("flow_id", "")
+        node_ids: set[str] = set(args.get("node_ids") or [])
+        types: set[str] = set(args.get("types") or [])
+        if not flow_id or (not node_ids and not types):
+            return json.dumps({"error": "flow_id and (node_ids or types) required"})
+
+        flow = await self._session_call_json("get_flow", {"flow_id": flow_id})
+        if not isinstance(flow, dict):
+            return json.dumps({"error": "get_flow returned non-dict payload"})
+        data = flow.get("data") or {}
+        nodes = list(data.get("nodes") or [])
+        edges = list(data.get("edges") or [])
+
+        if types:
+            for n in nodes:
+                t = (n.get("data") or {}).get("type") or n.get("type", "")
+                nid = n.get("id", "")
+                if t in types and nid:
+                    node_ids.add(nid)
+
+        if not node_ids:
+            return json.dumps({
+                "flow_id": flow_id,
+                "removed_node_ids": [],
+                "removed_edge_count": 0,
+                "note": "no matching nodes",
+            })
+
+        kept_nodes = [n for n in nodes if n.get("id") not in node_ids]
+        kept_edges = [
+            e for e in edges
+            if e.get("source") not in node_ids and e.get("target") not in node_ids
+        ]
+        removed_edge_count = len(edges) - len(kept_edges)
+
+        new_data = {**data, "nodes": kept_nodes, "edges": kept_edges}
+        await self._session.call_tool(
+            "update_flow",
+            {"flow_id": flow_id, "data": new_data},
+        )
+        return json.dumps({
+            "flow_id": flow_id,
+            "removed_node_ids": sorted(node_ids),
+            "removed_edge_count": removed_edge_count,
+        })
+
     async def call_tool(self, name: str, arguments: dict) -> Any:
         if self._session is None:
             raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        if name == "delete_node":
+            return await self._handle_delete_node(arguments)
 
         # search_flows virtual tool
         if name == "search_flows":

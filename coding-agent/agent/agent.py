@@ -375,6 +375,27 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     def _enrich_update_merge(existing_data: dict, payload_data: dict) -> dict:
                         existing_nodes = list(existing_data.get("nodes", []) or [])
                         existing_edges = list(existing_data.get("edges", []) or [])
+
+                        # Honor explicit removal lists in the payload. Lets LLM combine
+                        # "add X / remove Y" in one update_flow call without falling into
+                        # the union-only merge trap.
+                        remove_ids: set[str] = set(payload_data.get("remove_node_ids") or [])
+                        remove_types: set[str] = set(payload_data.get("remove_types") or [])
+                        if remove_types:
+                            for n in existing_nodes:
+                                t = (n.get("data") or {}).get("type") or n.get("type", "")
+                                if t in remove_types and n.get("id"):
+                                    remove_ids.add(n["id"])
+                        if remove_ids:
+                            existing_nodes = [n for n in existing_nodes if n.get("id") not in remove_ids]
+                            existing_edges = [
+                                e for e in existing_edges
+                                if e.get("source") not in remove_ids and e.get("target") not in remove_ids
+                            ]
+                            console.print(f"[dim]↳ removing {len(remove_ids)} node(s): {sorted(remove_ids)}[/dim]")
+                            # Strip control fields so they don't leak into PATCH body
+                            payload_data = {k: v for k, v in payload_data.items() if k not in ("remove_node_ids", "remove_types")}
+
                         existing_node_ids = {n.get("id", "") for n in existing_nodes if n.get("id")}
                         existing_edge_ids = {e.get("id", "") for e in existing_edges if e.get("id")}
 

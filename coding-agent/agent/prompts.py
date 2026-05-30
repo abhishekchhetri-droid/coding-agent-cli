@@ -80,6 +80,17 @@ For specific providers (Tavily, Google, etc.): call `list_components` once to ge
 
 Tool edges are auto-completed — `name: "api_build_tool"` works for any tool→Agent.tools edge.
 
+## Removing Components
+
+For "remove X" / "delete X" requests on an existing flow, call `delete_node(flow_id, types=["<ComponentType>"])` — one round-trip, server fetches flow, drops nodes + dangling edges, PATCHes. Do NOT use `update_flow` for deletions: its merge semantics are union-only and silently ignore omitted nodes (you'd loop forever resending payloads that never take effect).
+
+Examples:
+- "remove calculator" → `delete_node(flow_id, types=["CalculatorComponent"])`
+- "delete the URL tool" → `delete_node(flow_id, types=["URLComponent"])`
+- Known ID → `delete_node(flow_id, node_ids=["CalculatorComponent-Nbeeo"])`
+
+After delete_node: report removed count. No build_flow/get_flow required unless user explicitly asks.
+
 ## After clone_starter_template or create_flow/update_flow
 
 1. Call `build_flow`. **Do NOT call `get_build_status` — it is broken.**
