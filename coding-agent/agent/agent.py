@@ -378,12 +378,53 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         existing_node_ids = {n.get("id", "") for n in existing_nodes if n.get("id")}
                         existing_edge_ids = {e.get("id", "") for e in existing_edges if e.get("id")}
 
+                        # Type → existing-node-id map. LLMs routinely invent fresh IDs
+                        # ("ChatInput-1") for components that already exist in the flow under
+                        # UUIDs. Without remapping we'd duplicate every structural node.
+                        existing_by_type: dict[str, str] = {}
+                        for _n in existing_nodes:
+                            _t = _n.get("data", {}).get("type") or _n.get("type", "")
+                            if _t and _t not in existing_by_type:
+                                existing_by_type[_t] = _n.get("id", "")
+
+                        id_map: dict[str, str] = {}
+                        for _n in payload_data.get("nodes", []):
+                            _nid = _n.get("id", "")
+                            if not _nid or _nid in existing_node_ids:
+                                continue
+                            _t = _n.get("data", {}).get("type") or _n.get("type", "")
+                            if _t in existing_by_type:
+                                id_map[_nid] = existing_by_type[_t]
+
+                        if id_map:
+                            for _src, _dst in id_map.items():
+                                console.print(f"[dim]↳ remap payload id '{_src}' → existing '{_dst}' (same type)[/dim]")
+
+                        def _remap_id(node_id: str) -> str:
+                            return id_map.get(node_id, node_id)
+
+                        def _remap_edge(e: dict) -> dict:
+                            e2 = dict(e)
+                            if e2.get("source") in id_map:
+                                e2["source"] = id_map[e2["source"]]
+                            if e2.get("target") in id_map:
+                                e2["target"] = id_map[e2["target"]]
+                            for hk in ("sourceHandle", "targetHandle"):
+                                h = e2.get(hk)
+                                if isinstance(h, dict) and h.get("id") in id_map:
+                                    h = dict(h)
+                                    h["id"] = id_map[h["id"]]
+                                    e2[hk] = h
+                            return e2
+
                         addition_nodes = [
                             n for n in payload_data.get("nodes", [])
-                            if n.get("id") and n.get("id") not in existing_node_ids
+                            if n.get("id")
+                            and n.get("id") not in existing_node_ids
+                            and n.get("id") not in id_map
                         ]
                         addition_edges = [
-                            e for e in payload_data.get("edges", [])
+                            _remap_edge(e) for e in payload_data.get("edges", [])
                             if (not e.get("id")) or e.get("id") not in existing_edge_ids
                         ]
                         console.print(f"[dim]↳ merging {len(addition_nodes)} new node(s), {len(addition_edges)} new edge(s) into flow[/dim]")

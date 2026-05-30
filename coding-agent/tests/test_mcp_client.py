@@ -106,16 +106,17 @@ def test_find_agent_node_returns_none_when_no_tools_field():
     assert LangflowMCPClient.find_agent_node(nodes) is None
 
 
-def test_offset_new_positions_places_additions_below_existing():
+def test_offset_new_positions_places_additions_right_of_existing():
     from mcpbridge.client import LangflowMCPClient
     existing = [
         {"id": "a", "position": {"x": 100, "y": 100}},
         {"id": "b", "position": {"x": 200, "y": 400}},
     ]
     additions = [{"id": "n1"}, {"id": "n2"}]
-    LangflowMCPClient.offset_new_positions(existing, additions, y_gap=200)
-    assert additions[0]["position"]["y"] == 600
-    assert additions[1]["position"]["y"] == 800
+    LangflowMCPClient.offset_new_positions(existing, additions, x_gap=350, y_gap=200)
+    # rightmost x + 350, vertical stack starting at topmost existing y
+    assert additions[0]["position"] == {"x": 550, "y": 100}
+    assert additions[1]["position"] == {"x": 550, "y": 300}
 
 
 def test_offset_new_positions_preserves_explicit_positions():

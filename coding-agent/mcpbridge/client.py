@@ -523,26 +523,33 @@ class LangflowMCPClient:
     def offset_new_positions(
         existing: list[dict],
         additions: list[dict],
-        x_default: int = 250,
+        x_gap: int = 350,
         y_gap: int = 200,
     ) -> None:
         """Mutate additions in place: assign positions to nodes lacking explicit ones.
 
-        New nodes get y-coords below the bottom-most existing node so they don't overlap
-        the existing canvas. Nodes that already carry a position dict are left alone.
+        New nodes are stacked vertically to the RIGHT of the existing canvas so they
+        sit alongside existing nodes inside the same viewport (rather than far below
+        where users have to scroll to find them). Nodes that already carry a complete
+        position dict are left alone.
         """
-        existing_ys = [
-            n.get("position", {}).get("y", 0)
+        existing_positions = [
+            n.get("position", {})
             for n in existing
             if isinstance(n.get("position"), dict)
         ]
-        base_y = (max(existing_ys) + y_gap) if existing_ys else y_gap
+        if existing_positions:
+            base_x = max(p.get("x", 0) for p in existing_positions) + x_gap
+            base_y = min(p.get("y", 0) for p in existing_positions)
+        else:
+            base_x = 250
+            base_y = 200
         next_y = base_y
         for n in additions:
             pos = n.get("position")
             if isinstance(pos, dict) and "x" in pos and "y" in pos:
                 continue
-            n["position"] = {"x": x_default, "y": next_y}
+            n["position"] = {"x": base_x, "y": next_y}
             next_y += y_gap
 
     @staticmethod
