@@ -253,6 +253,8 @@ Usage Examples:
 6. Rename and move: { flow_id: "flow-uuid", name: "New Name", folder_id: "folder-uuid" }
 
 Best Practices:
+- DELTA MERGE: when adding components to an existing flow, send ONLY the new nodes/edges in 'data'. The agent fetches the current flow and merges automatically — do NOT resend existing nodes (they will be preserved untouched).
+- FULL REPLACE: only send the complete flow in 'data' if you intend to overwrite everything (e.g., user asks to rebuild a flow from scratch).
 - Get current flow data with get_flow before updating to avoid overwriting changes
 - Only specify fields you want to change (partial updates supported)
 - Rebuild flow with build_flow after data modifications to validate changes

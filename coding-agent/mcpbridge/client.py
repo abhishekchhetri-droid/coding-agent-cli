@@ -477,6 +477,113 @@ class LangflowMCPClient:
             result.append(edge)
         return result
 
+    @staticmethod
+    def find_node_by_type(nodes: list[dict], type_name: str) -> dict | None:
+        """Return first node whose data.type matches type_name, or None."""
+        for n in nodes:
+            if n.get("data", {}).get("type") == type_name:
+                return n
+        return None
+
+    @staticmethod
+    def find_llm_node(nodes: list[dict]) -> dict | None:
+        """Return first node whose outputs include LanguageModel, prioritising AzureOpenAIModel.
+
+        Detection is output-type driven, not name-driven, so any LLM component
+        (LanguageModelComponent, OpenAI, Anthropic, etc.) is matched.
+        """
+        def outputs_langmodel(n: dict) -> bool:
+            return any(
+                "LanguageModel" in (o.get("types") or o.get("output_types") or [])
+                for o in n.get("data", {}).get("node", {}).get("outputs", [])
+            )
+
+        llm_nodes = [n for n in nodes if outputs_langmodel(n)]
+        if not llm_nodes:
+            return None
+        azure = next(
+            (n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"),
+            None,
+        )
+        return azure or llm_nodes[0]
+
+    @staticmethod
+    def find_agent_node(nodes: list[dict]) -> dict | None:
+        """Return first node that has a `tools` template field (i.e., any Agent variant).
+
+        Match by template structure, not type name, so ToolCallingAgent / custom agents work.
+        """
+        for n in nodes:
+            tmpl = n.get("data", {}).get("node", {}).get("template", {})
+            if "tools" in tmpl:
+                return n
+        return None
+
+    @staticmethod
+    def offset_new_positions(
+        existing: list[dict],
+        additions: list[dict],
+        x_default: int = 250,
+        y_gap: int = 200,
+    ) -> None:
+        """Mutate additions in place: assign positions to nodes lacking explicit ones.
+
+        New nodes get y-coords below the bottom-most existing node so they don't overlap
+        the existing canvas. Nodes that already carry a position dict are left alone.
+        """
+        existing_ys = [
+            n.get("position", {}).get("y", 0)
+            for n in existing
+            if isinstance(n.get("position"), dict)
+        ]
+        base_y = (max(existing_ys) + y_gap) if existing_ys else y_gap
+        next_y = base_y
+        for n in additions:
+            pos = n.get("position")
+            if isinstance(pos, dict) and "x" in pos and "y" in pos:
+                continue
+            n["position"] = {"x": x_default, "y": next_y}
+            next_y += y_gap
+
+    @staticmethod
+    def classify_update_payload(
+        payload_data: dict | None,
+        existing_node_ids: set[str],
+    ) -> str:
+        """Return 'patch_meta', 'full_replace', or 'merge'.
+
+        - patch_meta:  payload_data has no `nodes` key (rename / folder move only).
+        - full_replace: every existing node id appears in payload (LLM resent whole flow).
+        - merge:       payload contains a delta (some new ids, some/no existing ids).
+        """
+        if not isinstance(payload_data, dict) or "nodes" not in payload_data:
+            return "patch_meta"
+        payload_ids = {n.get("id", "") for n in payload_data.get("nodes", []) if n.get("id")}
+        if existing_node_ids and existing_node_ids.issubset(payload_ids):
+            return "full_replace"
+        return "merge"
+
+    @staticmethod
+    def merge_flow_data(existing_data: dict, payload_data: dict) -> dict:
+        """Merge payload's new nodes/edges into existing_data; existing entries take precedence by id."""
+        existing_nodes = list(existing_data.get("nodes", []))
+        existing_edges = list(existing_data.get("edges", []))
+        existing_node_ids = {n.get("id", "") for n in existing_nodes}
+        existing_edge_ids = {e.get("id", "") for e in existing_edges if e.get("id")}
+
+        addition_nodes = [
+            n for n in payload_data.get("nodes", [])
+            if n.get("id") and n.get("id") not in existing_node_ids
+        ]
+        addition_edges = [
+            e for e in payload_data.get("edges", [])
+            if (not e.get("id")) or e.get("id") not in existing_edge_ids
+        ]
+        merged = dict(existing_data)
+        merged["nodes"] = existing_nodes + addition_nodes
+        merged["edges"] = existing_edges + addition_edges
+        return merged
+
     def ensure_tool_edges(self, nodes: list[dict], edges: list[dict]) -> list[dict]:
         """Auto-add missing Tool→Agent.tools edges when tool-capable nodes have no connection.
 
