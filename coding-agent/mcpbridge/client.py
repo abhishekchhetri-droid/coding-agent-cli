@@ -203,11 +203,26 @@ class LangflowMCPClient:
                     f"Unknown component type: {node_type!r}. "
                     f"Call list_components to find the exact 'type' string, then retry."
                 )
+            # Capture show=True fields from original template before clobbering with live schema.
+            # Live schema defaults many fields to show=False (e.g. lexical_terms on AstraDB);
+            # template-saved nodes may have show=True with edges wired — we must preserve that.
+            _orig_tmpl = (node.get("data") or {}).get("node", {}).get("template", {})
+            _original_shows: dict[str, bool] = {
+                _fn: True
+                for _fn, _fd in (_orig_tmpl.items() if isinstance(_orig_tmpl, dict) else [])
+                if isinstance(_fd, dict) and _fd.get("show") is True
+            }
             # Always use the live schema — template-cloned nodes can carry stale data.node
             # (missing display_name, empty outputs) which causes the Langflow frontend to show
             # "undefined" for node names and drop all edges as invalid.
             # data.type is preserved separately so the canvas renderer stays correct.
             data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy of live schema
+            # Restore show=True from original template (live schema may default to show=False)
+            if _original_shows:
+                _live_tmpl = data["node"].get("template", {})
+                for _fn, _ in _original_shows.items():
+                    if _fn in _live_tmpl and isinstance(_live_tmpl[_fn], dict):
+                        _live_tmpl[_fn]["show"] = True
             # Only patch data.type for fresh nodes — for template nodes data.type is already correct
             if "node" not in node.get("data", {}):
                 if node_type != raw_type:
@@ -477,6 +492,120 @@ class LangflowMCPClient:
             result.append(edge)
         return result
 
+    @staticmethod
+    def find_node_by_type(nodes: list[dict], type_name: str) -> dict | None:
+        """Return first node whose data.type matches type_name, or None."""
+        for n in nodes:
+            if n.get("data", {}).get("type") == type_name:
+                return n
+        return None
+
+    @staticmethod
+    def find_llm_node(nodes: list[dict]) -> dict | None:
+        """Return first node whose outputs include LanguageModel, prioritising AzureOpenAIModel.
+
+        Detection is output-type driven, not name-driven, so any LLM component
+        (LanguageModelComponent, OpenAI, Anthropic, etc.) is matched.
+        """
+        def outputs_langmodel(n: dict) -> bool:
+            return any(
+                "LanguageModel" in (o.get("types") or o.get("output_types") or [])
+                for o in n.get("data", {}).get("node", {}).get("outputs", [])
+            )
+
+        llm_nodes = [n for n in nodes if outputs_langmodel(n)]
+        if not llm_nodes:
+            return None
+        azure = next(
+            (n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"),
+            None,
+        )
+        return azure or llm_nodes[0]
+
+    @staticmethod
+    def find_agent_node(nodes: list[dict]) -> dict | None:
+        """Return first node that has a `tools` template field (i.e., any Agent variant).
+
+        Match by template structure, not type name, so ToolCallingAgent / custom agents work.
+        """
+        for n in nodes:
+            tmpl = n.get("data", {}).get("node", {}).get("template", {})
+            if "tools" in tmpl:
+                return n
+        return None
+
+    @staticmethod
+    def offset_new_positions(
+        existing: list[dict],
+        additions: list[dict],
+        x_gap: int = 350,
+        y_gap: int = 200,
+    ) -> None:
+        """Mutate additions in place: assign positions to nodes lacking explicit ones.
+
+        New nodes are stacked vertically to the RIGHT of the existing canvas so they
+        sit alongside existing nodes inside the same viewport (rather than far below
+        where users have to scroll to find them). Nodes that already carry a complete
+        position dict are left alone.
+        """
+        existing_positions = [
+            n.get("position", {})
+            for n in existing
+            if isinstance(n.get("position"), dict)
+        ]
+        if existing_positions:
+            base_x = max(p.get("x", 0) for p in existing_positions) + x_gap
+            base_y = min(p.get("y", 0) for p in existing_positions)
+        else:
+            base_x = 250
+            base_y = 200
+        next_y = base_y
+        for n in additions:
+            pos = n.get("position")
+            if isinstance(pos, dict) and "x" in pos and "y" in pos:
+                continue
+            n["position"] = {"x": base_x, "y": next_y}
+            next_y += y_gap
+
+    @staticmethod
+    def classify_update_payload(
+        payload_data: dict | None,
+        existing_node_ids: set[str],
+    ) -> str:
+        """Return 'patch_meta', 'full_replace', or 'merge'.
+
+        - patch_meta:  payload_data has no `nodes` key (rename / folder move only).
+        - full_replace: every existing node id appears in payload (LLM resent whole flow).
+        - merge:       payload contains a delta (some new ids, some/no existing ids).
+        """
+        if not isinstance(payload_data, dict) or "nodes" not in payload_data:
+            return "patch_meta"
+        payload_ids = {n.get("id", "") for n in payload_data.get("nodes", []) if n.get("id")}
+        if existing_node_ids and existing_node_ids.issubset(payload_ids):
+            return "full_replace"
+        return "merge"
+
+    @staticmethod
+    def merge_flow_data(existing_data: dict, payload_data: dict) -> dict:
+        """Merge payload's new nodes/edges into existing_data; existing entries take precedence by id."""
+        existing_nodes = list(existing_data.get("nodes", []))
+        existing_edges = list(existing_data.get("edges", []))
+        existing_node_ids = {n.get("id", "") for n in existing_nodes}
+        existing_edge_ids = {e.get("id", "") for e in existing_edges if e.get("id")}
+
+        addition_nodes = [
+            n for n in payload_data.get("nodes", [])
+            if n.get("id") and n.get("id") not in existing_node_ids
+        ]
+        addition_edges = [
+            e for e in payload_data.get("edges", [])
+            if (not e.get("id")) or e.get("id") not in existing_edge_ids
+        ]
+        merged = dict(existing_data)
+        merged["nodes"] = existing_nodes + addition_nodes
+        merged["edges"] = existing_edges + addition_edges
+        return merged
+
     def ensure_tool_edges(self, nodes: list[dict], edges: list[dict]) -> list[dict]:
         """Auto-add missing Tool→Agent.tools edges when tool-capable nodes have no connection.
 
@@ -690,6 +819,39 @@ class LangflowMCPClient:
         {
             "type": "function",
             "function": {
+                "name": "delete_node",
+                "description": (
+                    "Remove one or more nodes from a flow in a single round-trip. "
+                    "Fetches the flow, drops matched nodes + any edges referencing them, "
+                    "and PATCHes the result. Use this for 'remove X' / 'delete X' user requests "
+                    "instead of update_flow — update_flow's merge semantics can only ADD, "
+                    "never remove, so a delete via update_flow silently no-ops. "
+                    "Pass node_ids (exact IDs from get_flow) OR types (e.g. 'CalculatorComponent', "
+                    "'URLComponent'); type→ID resolution happens server-side. "
+                    "Returns {flow_id, removed_node_ids, removed_edge_count}."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "flow_id": {"type": "string", "description": "Flow UUID"},
+                        "node_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exact node IDs to delete (preferred when known)",
+                        },
+                        "types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Component types — every node of these types is removed",
+                        },
+                    },
+                    "required": ["flow_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "get_starter_template",
                 "description": (
                     "Get full nodes[] and edges[] for ONE specific starter template by name or id. "
@@ -755,9 +917,69 @@ class LangflowMCPClient:
             if t.name in self._CORE_TOOLS
         ] + self._VIRTUAL_TOOLS
 
+    async def _handle_delete_node(self, args: dict) -> str:
+        """Server-side node removal: get_flow → drop matched nodes + dangling edges → PATCH → build.
+        Bypasses agent merge logic (which is union-only and cannot remove)."""
+        from rich.console import Console as _Console
+        _con = _Console()
+
+        flow_id = args.get("flow_id", "")
+        node_ids: set[str] = set(args.get("node_ids") or [])
+        types: set[str] = set(args.get("types") or [])
+        if not flow_id or (not node_ids and not types):
+            return json.dumps({"error": "flow_id and (node_ids or types) required"})
+
+        flow = await self._session_call_json("get_flow", {"flow_id": flow_id})
+        if not isinstance(flow, dict):
+            return json.dumps({"error": "get_flow returned non-dict payload"})
+        data = flow.get("data") or {}
+        nodes = list(data.get("nodes") or [])
+        edges = list(data.get("edges") or [])
+
+        if types:
+            for n in nodes:
+                t = (n.get("data") or {}).get("type") or n.get("type", "")
+                nid = n.get("id", "")
+                if t in types and nid:
+                    node_ids.add(nid)
+
+        if not node_ids:
+            _con.print(f"[yellow]↳ delete_node: no nodes matched types={sorted(types)} in flow {flow_id}[/yellow]")
+            return json.dumps({
+                "flow_id": flow_id,
+                "removed_node_ids": [],
+                "removed_edge_count": 0,
+                "note": "no matching nodes",
+            })
+
+        kept_nodes = [n for n in nodes if n.get("id") not in node_ids]
+        kept_edges = [
+            e for e in edges
+            if e.get("source") not in node_ids and e.get("target") not in node_ids
+        ]
+        removed_edge_count = len(edges) - len(kept_edges)
+        _con.print(f"[dim]↳ delete_node: removing {sorted(node_ids)}, dropping {removed_edge_count} edge(s)[/dim]")
+
+        new_data = {**data, "nodes": kept_nodes, "edges": kept_edges}
+        await self._session.call_tool(
+            "update_flow",
+            {"flow_id": flow_id, "data": new_data},
+        )
+        # Trigger a build so Langflow invalidates its canvas cache and the UI
+        # reflects the removal immediately without needing a browser refresh.
+        await self._session.call_tool("build_flow", {"flow_id": flow_id})
+        return json.dumps({
+            "flow_id": flow_id,
+            "removed_node_ids": sorted(node_ids),
+            "removed_edge_count": removed_edge_count,
+        })
+
     async def call_tool(self, name: str, arguments: dict) -> Any:
         if self._session is None:
             raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        if name == "delete_node":
+            return await self._handle_delete_node(arguments)
 
         # search_flows virtual tool
         if name == "search_flows":

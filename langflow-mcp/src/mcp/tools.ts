@@ -253,6 +253,10 @@ Usage Examples:
 6. Rename and move: { flow_id: "flow-uuid", name: "New Name", folder_id: "folder-uuid" }
 
 Best Practices:
+- DELTA MERGE: when adding components to an existing flow, send ONLY the new nodes/edges in 'data'. The agent fetches the current flow and merges automatically — do NOT resend existing nodes (they will be preserved untouched).
+- REUSE EXISTING IDs: any edge from a new node to an existing one MUST use the existing node's real ID as returned by get_flow (e.g., "ChatInput-abc123de"), NOT a fresh generic ID like "ChatInput-1". If you do invent new IDs for components that already exist by type, the agent auto-remaps them — but reusing real IDs is cheaper and unambiguous.
+- REMOVING NODES: update_flow is union-only and will NOT delete omitted nodes. To remove components, either (a) call the `delete_node` tool (single round-trip), or (b) include `remove_node_ids: ["id1", ...]` or `remove_types: ["CalculatorComponent", ...]` inside `data` — the agent drops those nodes plus any edges referencing them before merging additions.
+- FULL REPLACE: only send the complete flow in 'data' if you intend to overwrite everything (e.g., user asks to rebuild a flow from scratch).
 - Get current flow data with get_flow before updating to avoid overwriting changes
 - Only specify fields you want to change (partial updates supported)
 - Rebuild flow with build_flow after data modifications to validate changes
