@@ -64,6 +64,20 @@ class RedisEntityCache:
             pipe.sadd("lf:starters:ids", *ids)
         await pipe.execute()
 
+    async def upsert_flow(self, flow_id: str, name: str, description: str = "", folder_id: str = "", updated_at: str = "") -> None:
+        """Update or insert a single flow entry. Call after any create/rename/update."""
+        if not self._client or not flow_id:
+            return
+        pipe = self._client.pipeline()
+        pipe.hset(f"lf:flow:{flow_id}", mapping={
+            "name": name,
+            "description": description or "",
+            "folder_id": folder_id or "",
+            "updated_at": updated_at or "",
+        })
+        pipe.sadd("lf:flows:ids", flow_id)
+        await pipe.execute()
+
     async def search_flows(self, query: str, limit: int | None = None) -> list[dict]:
         if not self._client:
             return []

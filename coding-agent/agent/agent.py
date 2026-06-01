@@ -700,6 +700,15 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                         "edge_count": len(tdata["edges"]),
                                     })
                                     console.print(f"[dim]↳ cloned '{template.get('name')}' → {created.get('id')} ({len(tdata['nodes'])} nodes, {len(tdata['edges'])} edges)[/dim]")
+                                    if mcp._redis_cache and created.get("id") and created.get("name"):
+                                        try:
+                                            await mcp._redis_cache.upsert_flow(
+                                                flow_id=created["id"],
+                                                name=created["name"],
+                                                description=created.get("description") or "",
+                                            )
+                                        except Exception:
+                                            pass
                             except Exception as clone_err:
                                 result = f"ERROR cloning template: {clone_err}"
                     elif tc["name"] == "get_starter_template":
@@ -797,6 +806,19 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     "name": flow.get("name"),
                                     "data": flow.get("data"),
                                 })
+                            # Keep Redis cache in sync so search_flows/list_flows reflect
+                            # renames and new flows without waiting for background sync.
+                            if isinstance(flow, dict) and flow.get("id") and flow.get("name") and mcp._redis_cache:
+                                try:
+                                    await mcp._redis_cache.upsert_flow(
+                                        flow_id=flow["id"],
+                                        name=flow["name"],
+                                        description=flow.get("description") or "",
+                                        folder_id=str(flow.get("folder_id") or ""),
+                                        updated_at=str(flow.get("updated_at") or ""),
+                                    )
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
