@@ -89,7 +89,7 @@ Examples:
 - "delete the URL tool" → `delete_node(flow_id, types=["URLComponent"])`
 - Known ID → `delete_node(flow_id, node_ids=["CalculatorComponent-Nbeeo"])`
 
-After delete_node: report removed count. No build_flow/get_flow required unless user explicitly asks.
+After delete_node: report removed count. Do NOT call build_flow or get_flow — delete_node already triggers a build internally to refresh the Langflow canvas.
 
 ## After clone_starter_template or create_flow/update_flow
 

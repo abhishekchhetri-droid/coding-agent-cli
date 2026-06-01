@@ -903,8 +903,11 @@ class LangflowMCPClient:
         ] + self._VIRTUAL_TOOLS
 
     async def _handle_delete_node(self, args: dict) -> str:
-        """Server-side node removal: get_flow → drop matched nodes + dangling edges → PATCH.
+        """Server-side node removal: get_flow → drop matched nodes + dangling edges → PATCH → build.
         Bypasses agent merge logic (which is union-only and cannot remove)."""
+        from rich.console import Console as _Console
+        _con = _Console()
+
         flow_id = args.get("flow_id", "")
         node_ids: set[str] = set(args.get("node_ids") or [])
         types: set[str] = set(args.get("types") or [])
@@ -926,6 +929,7 @@ class LangflowMCPClient:
                     node_ids.add(nid)
 
         if not node_ids:
+            _con.print(f"[yellow]↳ delete_node: no nodes matched types={sorted(types)} in flow {flow_id}[/yellow]")
             return json.dumps({
                 "flow_id": flow_id,
                 "removed_node_ids": [],
@@ -939,12 +943,16 @@ class LangflowMCPClient:
             if e.get("source") not in node_ids and e.get("target") not in node_ids
         ]
         removed_edge_count = len(edges) - len(kept_edges)
+        _con.print(f"[dim]↳ delete_node: removing {sorted(node_ids)}, dropping {removed_edge_count} edge(s)[/dim]")
 
         new_data = {**data, "nodes": kept_nodes, "edges": kept_edges}
         await self._session.call_tool(
             "update_flow",
             {"flow_id": flow_id, "data": new_data},
         )
+        # Trigger a build so Langflow invalidates its canvas cache and the UI
+        # reflects the removal immediately without needing a browser refresh.
+        await self._session.call_tool("build_flow", {"flow_id": flow_id})
         return json.dumps({
             "flow_id": flow_id,
             "removed_node_ids": sorted(node_ids),
