@@ -203,11 +203,26 @@ class LangflowMCPClient:
                     f"Unknown component type: {node_type!r}. "
                     f"Call list_components to find the exact 'type' string, then retry."
                 )
+            # Capture show=True fields from original template before clobbering with live schema.
+            # Live schema defaults many fields to show=False (e.g. lexical_terms on AstraDB);
+            # template-saved nodes may have show=True with edges wired — we must preserve that.
+            _orig_tmpl = (node.get("data") or {}).get("node", {}).get("template", {})
+            _original_shows: dict[str, bool] = {
+                _fn: True
+                for _fn, _fd in (_orig_tmpl.items() if isinstance(_orig_tmpl, dict) else [])
+                if isinstance(_fd, dict) and _fd.get("show") is True
+            }
             # Always use the live schema — template-cloned nodes can carry stale data.node
             # (missing display_name, empty outputs) which causes the Langflow frontend to show
             # "undefined" for node names and drop all edges as invalid.
             # data.type is preserved separately so the canvas renderer stays correct.
             data["node"] = json.loads(json.dumps(schemas[node_type]))  # deep copy of live schema
+            # Restore show=True from original template (live schema may default to show=False)
+            if _original_shows:
+                _live_tmpl = data["node"].get("template", {})
+                for _fn, _ in _original_shows.items():
+                    if _fn in _live_tmpl and isinstance(_live_tmpl[_fn], dict):
+                        _live_tmpl[_fn]["show"] = True
             # Only patch data.type for fresh nodes — for template nodes data.type is already correct
             if "node" not in node.get("data", {}):
                 if node_type != raw_type:
