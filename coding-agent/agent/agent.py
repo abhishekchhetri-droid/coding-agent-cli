@@ -800,6 +800,11 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             flow = json.loads(result) if isinstance(result, str) else result
                             if isinstance(flow, dict) and "data" in flow:
                                 for node in flow.get("data", {}).get("nodes", []):
+                                    # Preserve data.node for noteNodes: their visible text is
+                                    # stored in data.node.description, not a component schema.
+                                    # Stripping it blanks the note permanently on full_replace.
+                                    if node.get("type") == "noteNode" or node.get("data", {}).get("type") in ("note", "noteNode"):
+                                        continue
                                     node.get("data", {}).pop("node", None)
                                 result = json.dumps({
                                     "id": flow.get("id"),
