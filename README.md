@@ -8,11 +8,13 @@ Natural language interface for building and managing [Langflow](https://github.c
 
 ```
 nokia/
-├── coding-agent/        — Python CLI agent (chat REPL + direct commands)
+├── coding-agent/        — Python agent: chat REPL, direct commands, + AG-UI server (server/)
 ├── langflow-mcp/        — MCP stdio bridge (Node.js, talks to Langflow REST API)
+├── web/                 — CopilotKit web UI (Next.js): chat + live Langflow canvas
 ├── docker-compose.yml   — Langflow + Redis stack
 ├── scripts/
-│   └── start-langflow-mcp.sh  — starts MCP bridge with .env credentials
+│   ├── start-langflow-mcp.sh  — starts MCP bridge with .env credentials
+│   └── start-web.sh           — starts AG-UI server (:8000) + Next.js UI (:3000)
 └── .env                 — all secrets live here
 ```
 
@@ -87,6 +89,22 @@ Langflow REST API (localhost:7860)
     ▼
 Flow ready — ID returned
 ```
+
+---
+
+## Web UI (CopilotKit)
+
+A browser experience with a chat panel and the Langflow flow canvas side-by-side —
+describe a flow, watch it render live. Same agent loop as the REPL, exposed over the
+AG-UI protocol.
+
+```bash
+docker compose up -d                 # Langflow + Redis
+cd web && npm install                # first time only
+scripts/start-web.sh                 # agent server :8000 + Next.js UI :3000
+```
+
+Open http://localhost:3000. See [web/README.md](web/README.md) for architecture.
 
 ---
 
