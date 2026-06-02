@@ -238,11 +238,12 @@ class LangflowMCPClient:
             # Ensure data.type and data.id are always set
             data.setdefault("type", raw_type)  # preserve original type if not already set
             data.setdefault("id", node.get("id", ""))
-            # For nodes with multiple outputs, pin the correct active output so the
-            # canvas connects the right handle (e.g. model_output not text_output).
-            _SELECTED_OUTPUTS = {"AzureOpenAIModel": "model_output", "AnthropicModel": "model_output"}
-            if node_type in _SELECTED_OUTPUTS:
-                data.setdefault("selected_output", _SELECTED_OUTPUTS[node_type])
+            # Default selected_output for dual-output LLM nodes — overridden later by
+            # fix_selected_outputs() once edges are known and wiring is clear.
+            outputs = data.get("node", {}).get("outputs", [])
+            output_names = {o.get("name") for o in outputs}
+            if "model_output" in output_names and "text_output" in output_names:
+                data.setdefault("selected_output", "model_output")
             node["data"] = data
             # React-flow requires type="genericNode" for Langflow's custom node renderer.
             # The component type lives in data.type; top-level type is only for the canvas.
@@ -423,8 +424,17 @@ class LangflowMCPClient:
             sh = self._parse_handle(edge.get("sourceHandle", {}))
             th = self._parse_handle(edge.get("targetHandle", {}))
 
-            # Fix targetHandle.type from schema
+            # Sync handle ids with edge source/target — Langflow validates handle.id == node id.
+            # _remap_edge fixes edge.source/target but cannot fix handle.id when handle is a string;
+            # enrich_edges always has the final remapped ids, so we enforce them here.
+            sh = dict(sh)
             th = dict(th)
+            if edge.get("source"):
+                sh["id"] = edge["source"]
+            if edge.get("target"):
+                th["id"] = edge["target"]
+
+            # Fix targetHandle.type from schema
             tgt_node_id = edge.get("target", "")
             tgt_comp_type = node_type_map.get(tgt_node_id, "")
             field_name = th.get("fieldName", "")
@@ -491,6 +501,31 @@ class LangflowMCPClient:
 
             result.append(edge)
         return result
+
+    def fix_selected_outputs(self, nodes: list[dict], edges: list[dict]) -> None:
+        """Set selected_output on dual-output LLM nodes from actual wiring.
+
+        Nodes with both model_output (LanguageModel) and text_output (Message) must
+        select the right active handle based on what they connect to:
+          - Any outgoing edge whose targetHandle.type == 'model' → model_output
+            (consumed by Agent.model or any future LanguageModel-consuming field)
+          - Otherwise → text_output (Message — for ChatOutput, prompts, answer gen)
+
+        Called after enrich_edges so targetHandle.type is already resolved from schema.
+        Works for any LLM component regardless of name (AzureOpenAI, Anthropic, OpenAI…).
+        """
+        node_by_id = {n.get("id", ""): n for n in nodes}
+        for node in nodes:
+            outputs = node.get("data", {}).get("node", {}).get("outputs", [])
+            output_names = {o.get("name") for o in outputs}
+            if "model_output" not in output_names or "text_output" not in output_names:
+                continue
+            node_id = node.get("id", "")
+            feeds_model_input = any(
+                self._parse_handle(e.get("targetHandle") or {}).get("type") == "model"
+                for e in edges if e.get("source") == node_id
+            )
+            node["data"]["selected_output"] = "model_output" if feeds_model_input else "text_output"
 
     @staticmethod
     def find_node_by_type(nodes: list[dict], type_name: str) -> dict | None:
