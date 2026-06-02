@@ -57,6 +57,11 @@ class LangflowMCPClient:
         self._session: ClientSession | None = None
         self._tools_cache: list[Any] = []
         self._exit_stack: AsyncExitStack | None = None
+        # Serializes every MCP call: the stdio ClientSession is a single duplex
+        # pipe shared by the agent turn AND the periodic background sync. Without
+        # this, concurrent calls (e.g. a user request while _background_sync fires)
+        # interleave on one session and fail intermittently.
+        self._call_lock = asyncio.Lock()
         self._component_schema_cache: dict[str, Any] = {}  # type_name → full schema
         self._redis_cache = redis_cache
         self._sync_task: asyncio.Task | None = None
@@ -101,8 +106,14 @@ class LangflowMCPClient:
             except Exception as e:
                 logger.warning("Redis cold sync failed: %s", e)
 
+    async def _raw_call(self, name: str, args: dict) -> Any:
+        """Single funnel for every MCP request, serialized by _call_lock so the
+        shared stdio session is never used by two tasks at once."""
+        async with self._call_lock:
+            return await self._session.call_tool(name, args)
+
     async def _session_call_json(self, tool_name: str, args: dict) -> Any:
-        result = await self._session.call_tool(tool_name, args)
+        result = await self._raw_call(tool_name, args)
         if not result.content:
             return None
         item = result.content[0]
@@ -997,13 +1008,13 @@ class LangflowMCPClient:
         _con.print(f"[dim]↳ delete_node: removing {sorted(node_ids)}, dropping {removed_edge_count} edge(s)[/dim]")
 
         new_data = {**data, "nodes": kept_nodes, "edges": kept_edges}
-        await self._session.call_tool(
+        await self._raw_call(
             "update_flow",
             {"flow_id": flow_id, "data": new_data},
         )
         # Trigger a build so Langflow invalidates its canvas cache and the UI
         # reflects the removal immediately without needing a browser refresh.
-        await self._session.call_tool("build_flow", {"flow_id": flow_id})
+        await self._raw_call("build_flow", {"flow_id": flow_id})
         return json.dumps({
             "flow_id": flow_id,
             "removed_node_ids": sorted(node_ids),
@@ -1048,7 +1059,7 @@ class LangflowMCPClient:
                 starters = await self._redis_cache.list_all_starters()
                 return json.dumps(starters)
 
-        result = await self._session.call_tool(name, arguments)
+        result = await self._raw_call(name, arguments)
 
         # Lazy populate Redis on first MCP call when cold
         if name in ("list_flows", "list_starter_projects") and self._redis_cache and result.content:
