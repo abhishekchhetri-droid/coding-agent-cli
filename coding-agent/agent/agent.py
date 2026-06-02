@@ -370,6 +370,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         data["edges"] = mcp.ensure_tool_edges(data["nodes"], data.get("edges", []))
                         if "edges" in data:
                             data["edges"] = mcp.enrich_edges(data["edges"], data["nodes"])
+                        mcp.fix_selected_outputs(data["nodes"], data.get("edges", []))
                         return data
 
                     def _enrich_update_merge(existing_data: dict, payload_data: dict) -> dict:
@@ -398,6 +399,19 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                         existing_node_ids = {n.get("id", "") for n in existing_nodes if n.get("id")}
                         existing_edge_ids = {e.get("id", "") for e in existing_edges if e.get("id")}
+
+                        def _edge_fingerprint(e: dict) -> tuple:
+                            """Structural identity: same source node + target node + target field = same edge.
+                            Used to dedup edges the LLM resends without IDs (ID-based dedup misses these)."""
+                            th = e.get("targetHandle") or {}
+                            if isinstance(th, str):
+                                try:
+                                    th = json.loads(th.replace('œ', '"'))
+                                except Exception:
+                                    th = {}
+                            return (e.get("source", ""), e.get("target", ""), th.get("fieldName", ""))
+
+                        existing_edge_fingerprints = {_edge_fingerprint(e) for e in existing_edges}
 
                         # Type → existing-node-id map. LLMs routinely invent fresh IDs
                         # ("ChatInput-1") for components that already exist in the flow under
@@ -446,7 +460,8 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         ]
                         addition_edges = [
                             _remap_edge(e) for e in payload_data.get("edges", [])
-                            if (not e.get("id")) or e.get("id") not in existing_edge_ids
+                            if ((not e.get("id")) or e.get("id") not in existing_edge_ids)
+                            and _edge_fingerprint(_remap_edge(e)) not in existing_edge_fingerprints
                         ]
                         console.print(f"[dim]↳ merging {len(addition_nodes)} new node(s), {len(addition_edges)} new edge(s) into flow[/dim]")
 
@@ -550,6 +565,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         merged_edges = existing_edges + addition_edges
                         merged_edges = mcp.ensure_tool_edges(merged_nodes, merged_edges)
                         merged_edges = mcp.enrich_edges(merged_edges, merged_nodes)
+                        mcp.fix_selected_outputs(merged_nodes, merged_edges)
 
                         # Regression guard: every existing id must survive merge
                         final_ids = {n.get("id", "") for n in merged_nodes}
@@ -687,6 +703,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                         console.print("[dim]↳ injected Agent + wired ChatInput→Agent→ChatOutput[/dim]")
                                     tdata["edges"] = mcp.ensure_tool_edges(tdata["nodes"], tdata.get("edges", []))
                                     tdata["edges"] = mcp.enrich_edges(tdata["edges"], tdata["nodes"])
+                                    mcp.fix_selected_outputs(tdata["nodes"], tdata["edges"])
                                     created = mcp._create_flow_direct(
                                         name=flow_name or template.get("name", "Cloned Flow"),
                                         description=flow_desc or template.get("description", ""),
