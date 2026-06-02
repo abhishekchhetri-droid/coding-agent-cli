@@ -354,7 +354,15 @@ export class LangflowClient {
 
   async createVariable(variable: VariableCreate): Promise<VariableRead> {
     try {
-      const response = await this.client.post<VariableRead>('/variables/', variable);
+      // Langflow's POST /variables/ requires a non-empty `default_fields`
+      // (returns 422 "Field required" otherwise). The MCP schema marks it
+      // optional, so derive it from the variable's own name when the caller
+      // omits it — keeps the field's value adaptive, never a fixed constant.
+      const payload: VariableCreate =
+        variable.default_fields && variable.default_fields.length > 0
+          ? variable
+          : { ...variable, default_fields: [variable.name] };
+      const response = await this.client.post<VariableRead>('/variables/', payload);
       return response.data;
     } catch (error) {
       throw this.handleError(error, 'Failed to create variable');
