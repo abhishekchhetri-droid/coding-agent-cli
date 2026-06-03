@@ -434,7 +434,10 @@ class LangflowMCPClient:
             if edge.get("target"):
                 th["id"] = edge["target"]
 
-            # Fix targetHandle.type from schema
+            # Fix targetHandle.type AND inputTypes from schema. The frontend only
+            # renders an edge when its serialized targetHandle matches the string the
+            # node computes from its template, so stale inputTypes (from LLM guesses or
+            # legacy templates) silently drop the edge.
             tgt_node_id = edge.get("target", "")
             tgt_comp_type = node_type_map.get(tgt_node_id, "")
             field_name = th.get("fieldName", "")
@@ -443,6 +446,9 @@ class LangflowMCPClient:
                 actual_type = tmpl_field.get("type")
                 if actual_type:
                     th["type"] = actual_type
+                input_types = tmpl_field.get("input_types")
+                if input_types is not None:
+                    th["inputTypes"] = input_types
 
             # Rewrite sourceHandle for ALL tool edges (fieldName=="tools").
             # Runs regardless of tool_mode state — template clones, LLM-created edges, native tools.
@@ -482,10 +488,39 @@ class LangflowMCPClient:
                                 sh["name"] = "component_as_tool"
                                 sh["output_types"] = ["Tool"]
 
+            # Reconcile sourceHandle against the live schema for non-tool edges.
+            # (Tool edges already had their source rewritten above.) The LLM and legacy
+            # templates frequently supply a stale output name or *_types array; since the
+            # frontend renders an edge only when its serialized sourceHandle matches the
+            # string the node computes from schema, any stale field drops the edge — this
+            # is why ingestion edges (Directory/SplitText) silently disappeared while the
+            # main path survived. Resolve the real output: match by name → else the output
+            # whose types intersect the (already schema-corrected) target inputTypes →
+            # else the first output. Fully schema-driven, no per-component hardcoding.
+            if th.get("fieldName") != "tools":
+                src_node_id = edge.get("source", "")
+                src_comp_type = node_type_map.get(src_node_id, "")
+                if src_comp_type and src_comp_type in schemas:
+                    src_outputs = schemas[src_comp_type].get("outputs", []) or []
+                    if src_outputs:
+                        tgt_input_types = set(th.get("inputTypes") or [])
+                        chosen = next((o for o in src_outputs if o.get("name") == sh.get("name")), None)
+                        if chosen is None:
+                            chosen = next(
+                                (o for o in src_outputs if tgt_input_types & set(o.get("types") or [])),
+                                None,
+                            ) or src_outputs[0]
+                        sh["name"] = chosen.get("name", sh.get("name"))
+                        sh["output_types"] = chosen.get("types", sh.get("output_types"))
+                        sh["dataType"] = src_comp_type
+
             # Serialize handles using Langflow's œ-encoding (frontend np() function:
             # JSON.stringify(obj).replace(/"/g, "œ")) — sun() validation requires this format.
-            edge["sourceHandle"] = json.dumps(sh).replace('"', 'œ')
-            edge["targetHandle"] = json.dumps(th).replace('"', 'œ')
+            # JS JSON.stringify is compact (no spaces); Python's default json.dumps emits
+            # ", " / ": " separators, which makes the handle string fail to match the id the
+            # frontend computes and silently drops every edge. Force compact separators.
+            edge["sourceHandle"] = json.dumps(sh, separators=(",", ":")).replace('"', 'œ')
+            edge["targetHandle"] = json.dumps(th, separators=(",", ":")).replace('"', 'œ')
 
             # Ensure unique edge ID
             if "id" not in edge:
