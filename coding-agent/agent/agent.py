@@ -9,7 +9,7 @@ from llm.base import LLMProvider
 from mcpbridge.client import LangflowMCPClient
 from config.settings import Settings
 from agent.prompts import SYSTEM_PROMPT
-from agent.events import ConsoleSink
+from agent.events import ConsoleSink, slim_graph
 
 console = Console()
 
@@ -239,6 +239,7 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
             _starter_template_msg_ids: set[str] = set()
             for tc in response["tool_calls"]:
                 args = tc["arguments"]
+                _canvas_graph: dict | None = None  # slim graph for the live canvas, set when a tool returns flow data
 
                 # Auto-enrich nodes with full component schemas + credentials before sending to Langflow.
                 # create_flow and update_flow have distinct semantics:
@@ -696,7 +697,7 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
                                     "edge_count": len(tdata["edges"]),
                                 })
                                 console.print(f"[dim]↳ cloned '{template.get('name')}' → {created.get('id')} ({len(tdata['nodes'])} nodes, {len(tdata['edges'])} edges)[/dim]")
-                                sink.flow_built(created.get('id'))
+                                sink.flow_built(created.get('id'), graph=slim_graph({"data": tdata}))
                                 if mcp._redis_cache and created.get("id") and created.get("name"):
                                     try:
                                         await mcp._redis_cache.upsert_flow(
@@ -797,6 +798,8 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
                     try:
                         flow = json.loads(result) if isinstance(result, str) else result
                         if isinstance(flow, dict) and "data" in flow:
+                            # Capture the canvas graph BEFORE stripping data.node (labels live there).
+                            _canvas_graph = slim_graph(flow)
                             for node in flow.get("data", {}).get("nodes", []):
                                 # Preserve data.node for noteNodes: their visible text is
                                 # stored in data.node.description, not a component schema.
@@ -832,6 +835,36 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
                     _last_build_flow_id = None
 
                 messages.append(_tool_result_message(tc["id"], str(result)))
+
+                # Canvas sync: after create_flow (else path) capture new flow id;
+                # after any write op on the current flow, bust the iframe cache.
+                _tc_name = tc["name"]
+                _result_str = str(result)
+                if _tc_name == "create_flow":
+                    try:
+                        _r = json.loads(_result_str) if isinstance(_result_str, str) else _result_str
+                        if isinstance(_r, dict) and _r.get("id"):
+                            sink.flow_built(_r["id"], graph=_canvas_graph)
+                    except Exception:
+                        pass
+                elif sink.flow_id and not _result_str.startswith("ERROR"):
+                    _is_write = any(_tc_name.startswith(p) for p in ("delete_", "add_", "update_", "remove_", "patch_"))
+                    # Only push to the canvas when the op targets the flow on the canvas —
+                    # a get_flow/edit on some other flow must not overwrite what's shown.
+                    _target = args.get("flow_id") if isinstance(args, dict) else None
+                    _on_canvas = (not _target) or (_target == sink.flow_id)
+                    if _on_canvas and (_is_write or _tc_name == "get_flow"):
+                        graph = _canvas_graph
+                        # delete_node etc. return only a status — refetch the graph so the
+                        # canvas reflects the change.
+                        if graph is None and _is_write:
+                            try:
+                                _raw = await mcp.call_tool("get_flow", {"flow_id": sink.flow_id})
+                                _f = json.loads(_raw) if isinstance(_raw, str) else _raw
+                                graph = slim_graph(_f) if isinstance(_f, dict) else None
+                            except Exception:
+                                graph = None
+                        sink.flow_modified(graph=graph)
 
             iterations += 1
         else:

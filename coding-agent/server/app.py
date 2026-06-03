@@ -13,6 +13,7 @@ Conversation history is kept server-side per thread_id; run_turn trims it itself
 All credentials stay server-side — the browser never sees Azure/Langflow keys.
 """
 import asyncio
+import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -41,6 +42,7 @@ from mcpbridge.client import LangflowMCPClient
 from mcpbridge.redis_cache import RedisEntityCache
 from llm.registry import get_provider
 from agent.agent import run_turn
+from agent.events import slim_graph
 
 logger = logging.getLogger("agent.server")
 
@@ -56,18 +58,42 @@ class AGUISink:
         self._q = queue
         self._base = langflow_base_url.rstrip("/")
         self.flow_id: str | None = None
+        self.graph: dict | None = None  # last known graph, so graph-less snapshots don't blank the canvas
 
     def tool_call(self, name: str, arguments: dict) -> None:
         self._q.put_nowait(StepStartedEvent(type=EventType.STEP_STARTED, step_name=name))
         self._q.put_nowait(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=name))
 
-    def flow_built(self, flow_id: str | None) -> None:
+    def _snapshot(self, flow_id: str, graph: dict | None) -> dict:
+        # STATE_SNAPSHOT replaces the whole client state, so always include the last
+        # known graph — a graph-less signal (e.g. build_flow) must not erase the canvas.
+        if graph is not None:
+            self.graph = graph
+        snap = {"flow_id": flow_id, "flow_url": f"{self._base}/flow/{flow_id}"}
+        if self.graph is not None:
+            snap["graph"] = self.graph
+        return snap
+
+    def flow_built(self, flow_id: str | None, graph: dict | None = None) -> None:
         if not flow_id:
             return
         self.flow_id = flow_id
         self._q.put_nowait(StateSnapshotEvent(
             type=EventType.STATE_SNAPSHOT,
-            snapshot={"flow_id": flow_id, "flow_url": f"{self._base}/flow/{flow_id}"},
+            snapshot=self._snapshot(flow_id, graph),
+        ))
+
+    def flow_modified(self, graph: dict | None = None) -> None:
+        """Re-emit STATE_SNAPSHOT with the latest graph after in-place modifications.
+
+        The self-rendered canvas diffs by node id, so streaming the graph updates it in
+        place — no iframe reload, viewport preserved.
+        """
+        if not self.flow_id:
+            return
+        self._q.put_nowait(StateSnapshotEvent(
+            type=EventType.STATE_SNAPSHOT,
+            snapshot=self._snapshot(self.flow_id, graph),
         ))
 
     def final(self, text: str | None) -> None:
@@ -158,6 +184,10 @@ async def agent_endpoint(request: Request):
     encoder = EventEncoder()
     queue: "asyncio.Queue" = asyncio.Queue()
     sink = AGUISink(queue, settings.langflow_base_url)
+    # Seed the flow id from the thread so edits to an EXISTING flow (e.g. "remove the
+    # url tool") emit canvas snapshots. Without this, a turn that never calls create_flow
+    # leaves sink.flow_id=None and flow_modified() is suppressed.
+    sink.flow_id = _THREAD_FLOW.get(thread_id)
     _DONE = object()
 
     async def runner():
@@ -176,13 +206,24 @@ async def agent_endpoint(request: Request):
         yield encoder.encode(RunStartedEvent(
             type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id,
         ))
-        # Replay the thread's current flow so a reconnecting client keeps its canvas.
+        # Replay the thread's current flow so a reconnecting client repaints its canvas.
+        # Fetch the graph too — a reloaded browser has no prior state to diff against.
         prior_flow = _THREAD_FLOW.get(thread_id)
         if prior_flow:
             base = settings.langflow_base_url.rstrip("/")
+            snapshot = {"flow_id": prior_flow, "flow_url": f"{base}/flow/{prior_flow}"}
+            try:
+                raw = await mcp.call_tool("get_flow", {"flow_id": prior_flow})
+                flow = json.loads(raw) if isinstance(raw, str) else raw
+                graph = slim_graph(flow) if isinstance(flow, dict) else None
+                if graph is not None:
+                    snapshot["graph"] = graph
+                    sink.graph = graph  # seed so a graph-less build_flow this turn won't blank it
+            except Exception:
+                logger.warning("replay get_flow failed for %s", prior_flow, exc_info=True)
             yield encoder.encode(StateSnapshotEvent(
                 type=EventType.STATE_SNAPSHOT,
-                snapshot={"flow_id": prior_flow, "flow_url": f"{base}/flow/{prior_flow}"},
+                snapshot=snapshot,
             ))
 
         task = asyncio.create_task(runner())

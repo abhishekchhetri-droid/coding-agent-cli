@@ -6,8 +6,6 @@ import {
 import { HttpAgent } from "@ag-ui/client";
 import { NextRequest } from "next/server";
 
-// The agent name "langflow" must match the `agent` prop on <CopilotKit> and the
-// `name` passed to useCoAgent on the frontend.
 const runtime = new CopilotRuntime({
   agents: {
     langflow: new HttpAgent({
@@ -16,11 +14,22 @@ const runtime = new CopilotRuntime({
   },
 });
 
-export const POST = async (req: NextRequest) => {
+function makeHandler(req: NextRequest) {
   const { handleRequest } = copilotRuntimeNextJSAppRouterEndpoint({
     runtime,
     serviceAdapter: new ExperimentalEmptyAdapter(),
     endpoint: "/api/copilotkit",
   });
   return handleRequest(req);
+}
+
+export const GET = (req: NextRequest) => {
+  const { pathname } = new URL(req.url);
+  // Single-route mode only handles POST; return empty threads list so the UI doesn't 405.
+  if (pathname.endsWith("/threads")) {
+    return Response.json({ threads: [], nextCursor: null });
+  }
+  return makeHandler(req);
 };
+
+export const POST = (req: NextRequest) => makeHandler(req);
