@@ -14,17 +14,43 @@ from agent.events import ConsoleSink, slim_graph
 console = Console()
 
 
+def _canonical_handle(handle):
+    """Normalize a react-flow handle to Langflow's canonical string form.
+
+    Langflow's frontend matches edges to handles via ``scapedJSONStringfy``,
+    which is ``JSON.stringify(obj)`` — compact, NO spaces after ':' or ','.
+    Python's default ``json.dumps`` emits ``", "`` / ``": "`` separators, so an
+    object-based handle serialized that way never matches the handle id the
+    frontend computes from the node template, and the edge is silently dropped
+    on render. Always emit the compact form; also re-normalize handles that
+    arrive already-stringified (possibly space-polluted, possibly œ-escaped) so
+    re-saving repairs previously-broken flows.
+    """
+    if isinstance(handle, dict):
+        return json.dumps(handle, separators=(",", ":"))
+    if isinstance(handle, str):
+        try:
+            obj = json.loads(handle.replace("œ", '"'))
+        except (ValueError, TypeError):
+            return handle
+        canonical = json.dumps(obj, separators=(",", ":"))
+        # Preserve œ-escaping if the source used it (Langflow's wire format).
+        return canonical.replace('"', "œ") if "œ" in handle else canonical
+    return handle
+
+
 def _serialize_edge_handles(edges: list[dict]) -> list[dict]:
-    """Serialize sourceHandle/targetHandle as JSON strings and ensure each edge has an id.
-    React-flow requires handle identifiers to be strings, not objects.
+    """Serialize sourceHandle/targetHandle to Langflow's canonical handle form
+    and ensure each edge has an id. React-flow requires handle identifiers to be
+    compact JSON strings, not objects, and not space-padded.
     """
     result = []
     for i, edge in enumerate(edges):
         edge = dict(edge)
-        if isinstance(edge.get("sourceHandle"), dict):
-            edge["sourceHandle"] = json.dumps(edge["sourceHandle"])
-        if isinstance(edge.get("targetHandle"), dict):
-            edge["targetHandle"] = json.dumps(edge["targetHandle"])
+        if edge.get("sourceHandle") is not None:
+            edge["sourceHandle"] = _canonical_handle(edge["sourceHandle"])
+        if edge.get("targetHandle") is not None:
+            edge["targetHandle"] = _canonical_handle(edge["targetHandle"])
         if "id" not in edge:
             edge["id"] = f"{edge.get('source', 'src')}-{edge.get('target', 'tgt')}-{i}"
         result.append(edge)
