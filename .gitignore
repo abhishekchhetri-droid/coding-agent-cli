@@ -20,4 +20,5 @@ docs/
 
 # agent logs
 coding-agent/logs/*.log
-
+web
+walkthrough
