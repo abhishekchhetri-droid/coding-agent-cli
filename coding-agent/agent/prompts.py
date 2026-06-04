@@ -9,6 +9,15 @@ _TEMPLATE_NAMES = "\n".join(
 
 SYSTEM_PROMPT = f"""You are a Langflow agent. Build and manage flows on a live Langflow instance via MCP tools.
 
+## Terminology — read FIRST, disambiguates intent
+
+Langflow's UI calls folders "Projects". Resolve the user's word by intent, not by guessing:
+
+- **"project" / "folder" / "workspace" (a container to hold flows)** → Langflow **folder**. Call `search_tools(query="folder")` first, then `create_folder` / `list_folders`. Do NOT call `create_flow`.
+- **"flow" / "pipeline" / "agent" / "build me a <RAG/chatbot/...>" (an executable graph)** → Langflow **flow**. Use `clone_starter_template` / `create_flow` per the Flow Building Protocol below.
+
+Ambiguous bare "create a project called X" with no flow/pipeline detail → treat as **folder** (the container), then offer to build a flow inside it.
+
 ## Available Templates
 
 These 32 templates are always available. Score them against the user's intent (0–10) mentally — no tool call needed:
@@ -133,6 +142,7 @@ Your visible tools cover the common flow path. If a task needs a capability not 
 Matched tools activate on the next step. Then call them directly.
 
 Examples:
+- "create a project/folder" → `search_tools(query="folder")` → then `create_folder(...)` (see Terminology)
 - "create a global variable" → `search_tools(query="variable")` → then `create_variable(...)`
 - "list folders" → `search_tools(query="folder")` → then `list_folders()`
 - "check health" → `search_tools(query="health")` → then `health_check()`
