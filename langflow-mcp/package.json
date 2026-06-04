@@ -1,7 +1,7 @@
 {
   "name": "langflow-mcp-server",
-  "version": "3.1.1",
-  "description": "Integration for Langflow API 1.7.2 via Model Context Protocol (MCP)",
+  "version": "4.0.2",
+  "description": "Integration for Langflow API 1.9.6 via Model Context Protocol (MCP)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -13,6 +13,9 @@
   },
   "bin": {
     "langflow-mcp-server": "./dist/mcp/index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
