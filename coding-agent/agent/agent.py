@@ -225,6 +225,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 status_obj.update(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]")
 
         while iterations < settings.max_tool_iterations:
+            tools = mcp.get_tool_schemas()
             try:
                 t0 = time.perf_counter()
                 with console.status(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]", spinner="dots") as _status:

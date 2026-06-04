@@ -60,6 +60,7 @@ class LangflowMCPClient:
         self._component_schema_cache: dict[str, Any] = {}  # type_name → full schema
         self._redis_cache = redis_cache
         self._sync_task: asyncio.Task | None = None
+        self._discovered: list[str] = []  # FIFO, capped at _DISCOVERY_CAP; session-activated long-tail tools
 
     async def connect(self) -> None:
         self._exit_stack = AsyncExitStack()
@@ -818,13 +819,14 @@ class LangflowMCPClient:
                     pass
             return {"ok": False, "answer": "", "error": error_str}
 
-    _CORE_TOOLS = {
+    # Names here are required by Redis caching (this file) and result-stripping (agent.py) — single source of hot-path coupling.
+    _BASELINE_TOOLS = {
         "create_flow", "update_flow", "get_flow", "list_flows", "delete_flow",
         "build_flow", "run_flow",
-        "list_components", "list_variables", "list_folders",
-        "create_variable", "update_variable", "delete_variable",
-        "get_basic_examples", "list_starter_projects", "health_check",
+        "list_components", "get_basic_examples", "list_starter_projects",
     }
+
+    _DISCOVERY_CAP = 12  # max simultaneously-active long-tail tools
 
     _VIRTUAL_TOOLS = [
         {
@@ -941,6 +943,27 @@ class LangflowMCPClient:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_tools",
+                "description": (
+                    "Discover tools not currently visible. Call this when you need a capability "
+                    "that isn't in your active tool array (e.g. variables, folders, knowledge base, "
+                    "files, store, monitoring, health). "
+                    "Returns [{name, summary}] for matching tools. "
+                    "Matched tools become available on the NEXT step — then call them directly."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Capability keyword, e.g. 'variable', 'folder', 'health'"},
+                        "limit": {"type": "integer", "default": 8, "description": "Max results (default 8)"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
     ]
 
     def get_component_schema(self, type_name: str) -> dict:
@@ -975,6 +998,7 @@ class LangflowMCPClient:
         return {"type": type_name, "inputs": inputs, "outputs": outs}
 
     def get_tool_schemas(self) -> list[dict]:
+        active_names = self._BASELINE_TOOLS | set(self._discovered)
         return [
             {
                 "type": "function",
@@ -985,7 +1009,7 @@ class LangflowMCPClient:
                 },
             }
             for t in self._tools_cache
-            if t.name in self._CORE_TOOLS
+            if t.name in active_names
         ] + self._VIRTUAL_TOOLS
 
     async def _handle_delete_node(self, args: dict) -> str:
@@ -1045,12 +1069,37 @@ class LangflowMCPClient:
             "removed_edge_count": removed_edge_count,
         })
 
+    def _tool_summary(self, tool) -> str:
+        desc = tool.description or ""
+        first_line = desc.split("\n")[0].strip()
+        return first_line[:120] if first_line else tool.name
+
     async def call_tool(self, name: str, arguments: dict) -> Any:
         if self._session is None:
             raise RuntimeError("MCP client not connected. Call connect() first.")
 
         if name == "delete_node":
             return await self._handle_delete_node(arguments)
+
+        if name == "search_tools":
+            query = (arguments.get("query") or "").lower()
+            if not query:
+                return json.dumps([])
+            try:
+                limit = int(arguments.get("limit") or 8)
+            except (TypeError, ValueError):
+                limit = 8
+            matches = [
+                t for t in self._tools_cache
+                if query in t.name.lower() or query in (t.description or "").lower()
+            ][:limit]
+            # Activate matched tools: append to _discovered (dedupe), FIFO-evict past cap
+            for t in matches:
+                if t.name not in self._BASELINE_TOOLS and t.name not in self._discovered:
+                    self._discovered.append(t.name)
+            while len(self._discovered) > self._DISCOVERY_CAP:
+                self._discovered.pop(0)
+            return json.dumps([{"name": t.name, "summary": self._tool_summary(t)} for t in matches])
 
         # search_flows virtual tool
         if name == "search_flows":
