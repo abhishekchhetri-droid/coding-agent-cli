@@ -3,6 +3,7 @@ import gzip
 import json
 import logging
 import os
+import re
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -951,7 +952,7 @@ class LangflowMCPClient:
                     "Discover tools not currently visible. Call this when you need a capability "
                     "that isn't in your active tool array (e.g. variables, folders, knowledge base, "
                     "files, store, monitoring, health). "
-                    "Returns [{name, summary}] for matching tools. "
+                    "Returns {matches: [{name, summary}], note}. "
                     "Matched tools become available on the NEXT step — then call them directly."
                 ),
                 "parameters": {
@@ -998,7 +999,7 @@ class LangflowMCPClient:
         return {"type": type_name, "inputs": inputs, "outputs": outs}
 
     def get_tool_schemas(self) -> list[dict]:
-        active_names = self._BASELINE_TOOLS | set(self._discovered)
+        active_names = self._BASELINE_TOOLS | set(getattr(self, "_discovered", ()))
         return [
             {
                 "type": "function",
@@ -1082,24 +1083,50 @@ class LangflowMCPClient:
             return await self._handle_delete_node(arguments)
 
         if name == "search_tools":
-            query = (arguments.get("query") or "").lower()
+            query = (arguments.get("query") or "").strip().lower()
             if not query:
-                return json.dumps([])
+                return json.dumps({"matches": [], "note": "Empty query — pass a capability keyword, e.g. 'variable'."})
             try:
                 limit = int(arguments.get("limit") or 8)
             except (TypeError, ValueError):
                 limit = 8
-            matches = [
-                t for t in self._tools_cache
-                if query in t.name.lower() or query in (t.description or "").lower()
-            ][:limit]
+            limit = max(1, min(limit, 25))
+            # Token-scored ranking: phrase + per-token, name weighted over description.
+            # Beats naive substring — multi-word queries ("delete variable") still match.
+            tokens = [w for w in re.split(r"\W+", query) if len(w) >= 2]
+            scored = []
+            for t in self._tools_cache:
+                nm = t.name.lower()
+                desc = (t.description or "").lower()
+                score = 0
+                if query in nm:
+                    score += 5
+                elif query in desc:
+                    score += 2
+                for tok in tokens:
+                    if tok in nm:
+                        score += 3
+                    elif tok in desc:
+                        score += 1
+                if score > 0:
+                    scored.append((score, t))
+            scored.sort(key=lambda st: st[0], reverse=True)  # stable: ties keep cache order
+            matches = [t for _, t in scored[:limit]]
+            if not matches:
+                return json.dumps({
+                    "matches": [],
+                    "note": f"No tools matched '{query}'. Retry with a broader/different keyword.",
+                })
             # Activate matched tools: append to _discovered (dedupe), FIFO-evict past cap
             for t in matches:
                 if t.name not in self._BASELINE_TOOLS and t.name not in self._discovered:
                     self._discovered.append(t.name)
             while len(self._discovered) > self._DISCOVERY_CAP:
                 self._discovered.pop(0)
-            return json.dumps([{"name": t.name, "summary": self._tool_summary(t)} for t in matches])
+            return json.dumps({
+                "matches": [{"name": t.name, "summary": self._tool_summary(t)} for t in matches],
+                "note": "These tools are now active — call them directly on your next step.",
+            })
 
         # search_flows virtual tool
         if name == "search_flows":

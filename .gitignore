@@ -20,6 +20,9 @@ docs/
 
 # agent logs
 coding-agent/logs/*.log
+
+# flow exports (generated at runtime)
+coding-agent/exports/
 web
 walkthrough
 exports
