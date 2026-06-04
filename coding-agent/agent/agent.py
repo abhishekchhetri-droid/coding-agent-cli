@@ -203,6 +203,7 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
     turn_start = time.perf_counter()
 
     while iterations < settings.max_tool_iterations:
+        tools = mcp.get_tool_schemas()  # rebuilt each iteration so discovered tools appear next turn
         try:
             t0 = time.perf_counter()
             with console.status(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]", spinner="dots") as _status:
