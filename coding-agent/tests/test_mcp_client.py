@@ -15,11 +15,69 @@ async def test_client_converts_mcp_tools_to_openai_format():
     client = LangflowMCPClient.__new__(LangflowMCPClient)
     client._tools_cache = [mock_tool]
 
+    client._discovered = []
     schemas = client.get_tool_schemas()
-    assert len(schemas) == 1
-    assert schemas[0]["type"] == "function"
-    assert schemas[0]["function"]["name"] == "list_flows"
-    assert "properties" in schemas[0]["function"]["parameters"]
+    # baseline-matched cached tool + always-on virtual tools (search_tools, etc.)
+    converted = next(s for s in schemas if s["function"]["name"] == "list_flows")
+    assert converted["type"] == "function"
+    assert "properties" in converted["function"]["parameters"]
+    assert any(s["function"]["name"] == "search_tools" for s in schemas)
+
+
+def _mk_tool(name, desc):
+    t = MagicMock()
+    t.name = name
+    t.description = desc
+    t.inputSchema = {"type": "object", "properties": {}}
+    return t
+
+
+@pytest.mark.asyncio
+async def test_search_tools_ranks_name_match_above_description_and_activates():
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._session = object()
+    client._discovered = []
+    client._tools_cache = [
+        _mk_tool("create_variable", "Create a global variable"),
+        _mk_tool("list_flows", "List all flows; mentions variable in passing"),
+        _mk_tool("delete_variable", "Remove a variable by name"),
+    ]
+    import json as _json
+    out = _json.loads(await client.call_tool("search_tools", {"query": "variable"}))
+    names = [m["name"] for m in out["matches"]]
+    # name-matches rank ahead of description-only match (list_flows)
+    assert names[0] in ("create_variable", "delete_variable")
+    assert names[-1] == "list_flows"
+    # matched non-baseline tools become active for next turn
+    assert "create_variable" in client._discovered
+    schemas = client.get_tool_schemas()
+    assert any(s["function"]["name"] == "create_variable" for s in schemas)
+
+
+@pytest.mark.asyncio
+async def test_search_tools_empty_match_returns_hint():
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._session = object()
+    client._discovered = []
+    client._tools_cache = [_mk_tool("list_flows", "List all flows")]
+    import json as _json
+    out = _json.loads(await client.call_tool("search_tools", {"query": "zzznope"}))
+    assert out["matches"] == []
+    assert "note" in out
+
+
+@pytest.mark.asyncio
+async def test_search_tools_fifo_cap_bounds_active_set():
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._session = object()
+    client._discovered = []
+    client._tools_cache = [_mk_tool(f"tool_kb_{i}", "knowledge base op") for i in range(40)]
+    import json as _json
+    await client.call_tool("search_tools", {"query": "knowledge", "limit": 25})
+    assert len(client._discovered) <= LangflowMCPClient._DISCOVERY_CAP
 
 
 @pytest.mark.asyncio
