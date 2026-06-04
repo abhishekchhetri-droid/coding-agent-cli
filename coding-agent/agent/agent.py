@@ -1,7 +1,9 @@
 import asyncio
 import json
 import random
+import re
 import time
+from pathlib import Path
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -778,6 +780,35 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
                     except Exception:
                         pass
 
+                # download_* tools (flows/project/folder) return the full export JSON.
+                # Write it to disk and hand the LLM only a path receipt — otherwise the
+                # entire flow JSON floods context (defeats the dynamic-tools bloat goal).
+                if tc["name"].startswith("download_") and not str(result).startswith("ERROR"):
+                    try:
+                        parsed = json.loads(result) if isinstance(result, str) else result
+                        export_dir = Path.cwd() / "exports"
+                        export_dir.mkdir(exist_ok=True)
+                        items = parsed if isinstance(parsed, list) else [parsed]
+                        written = []
+                        for i, item in enumerate(items):
+                            if isinstance(item, dict):
+                                raw_name = str(item.get("name") or item.get("id") or tc["name"])
+                                fid = str(item.get("id") or "")[:8]
+                            else:
+                                raw_name, fid = tc["name"], str(i)
+                            slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip("-") or "export"
+                            fname = f"{slug}-{fid}.json" if fid else f"{slug}.json"
+                            path = export_dir / fname
+                            path.write_text(json.dumps(item, indent=2))
+                            written.append({"name": raw_name, "path": str(path), "bytes": path.stat().st_size})
+                        console.print(f"[dim]↳ exported {len(written)} file(s) → {export_dir}[/dim]")
+                        result = json.dumps({
+                            "exported": written,
+                            "_note": "Export JSON written to disk; full content not included here.",
+                        })
+                    except Exception as e:
+                        result = f"ERROR writing export: {e}"
+
                 if tc["name"] == "build_flow":
                     _last_build_flow_id = tc["arguments"].get("flow_id")
                     sink.flow_built(_last_build_flow_id)
@@ -916,6 +947,7 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
 
 
 async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings) -> None:
+    # Seed value for run_turn; it rebuilds tools each iteration so discovered tools appear next turn.
     tools = mcp.get_tool_schemas()
     messages: list[dict] = []
     _starter_cache: dict[str, dict] = {}  # name_lower/id → full template dict
