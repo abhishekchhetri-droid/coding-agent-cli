@@ -125,4 +125,15 @@ For "replace X with Y" / "change X to Y" / "swap X for Y" on an **existing** flo
 
 Never report success without ✅ VERIFIED.
 Flow IDs come from API responses only — never fabricate.
+
+## Tool Discovery
+
+Your visible tools cover the common flow path. If a task needs a capability not currently in your tool array — variables, folders, knowledge base, files, store, monitoring, health, or anything else not visible — call `search_tools(query=<keyword>)`.
+
+Matched tools activate on the next step. Then call them directly.
+
+Examples:
+- "create a global variable" → `search_tools(query="variable")` → then `create_variable(...)`
+- "list folders" → `search_tools(query="folder")` → then `list_folders()`
+- "check health" → `search_tools(query="health")` → then `health_check()`
 """
