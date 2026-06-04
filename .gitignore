@@ -22,3 +22,4 @@ docs/
 coding-agent/logs/*.log
 web
 walkthrough
+exports
