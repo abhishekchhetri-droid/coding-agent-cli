@@ -79,8 +79,10 @@ export interface DeleteFlowsRequest {
 
 export interface RunFlowRequest {
   input_value?: string;
+  output_component?: string;
   output_type?: string;
   input_type?: string;
+  session_id?: string;
   tweaks?: Record<string, unknown>;
 }
 
@@ -92,6 +94,10 @@ export interface RunResponse {
 
 export interface SimplifiedAPIRequest {
   input_value?: string;
+  input_type?: string;
+  output_component?: string;
+  output_type?: string;
+  session_id?: string;
   tweaks?: Record<string, unknown>;
   context?: Record<string, unknown>;
 }
@@ -289,6 +295,7 @@ export interface RunFlowSessionRequest {
   output_component?: string;
   tweaks?: Record<string, unknown>;
   session_id: string;
+  context?: Record<string, unknown>;
 }
 
 export interface RegistrationResponse {
@@ -371,11 +378,6 @@ export interface VerticesOrderResponse {
   [key: string]: any;
 }
 
-export interface GetVertexParams {
-  flow_id: string;
-  vertex_id: string;
-}
-
 export interface StreamVertexBuildParams {
   flow_id: string;
   vertex_id: string;
@@ -410,6 +412,8 @@ export interface UserUpdate {
   username?: string;
   password?: string;
   profile_image?: string;
+  is_active?: boolean;
+  is_superuser?: boolean;
   [key: string]: any;
 }
 
@@ -492,4 +496,249 @@ export interface ElevenLabsVoice {
 export interface HealthResponse {
   status: string;
   [key: string]: any;
+}
+
+// --- Langflow 1.9.x additional endpoints ---
+
+export interface FlowEventCreate {
+  type:
+    | 'component_added'
+    | 'component_removed'
+    | 'component_configured'
+    | 'connection_added'
+    | 'connection_removed'
+    | 'flow_updated'
+    | 'flow_settled';
+  summary?: string;
+}
+
+export interface ListFlowVersionsParams {
+  limit?: number;
+  offset?: number;
+  deployment_provider_id?: string;
+}
+
+export interface FlowEventsParams {
+  since?: number;
+}
+
+export interface DetectVarsRequest {
+  flow_version_ids: string[];
+}
+
+export interface DetectVarsResponse {
+  variables: string[];
+}
+
+export interface UpdateCustomComponentRequest {
+  code: string;
+  field: string;
+  template: Record<string, any>;
+  field_value?: any;
+  frontend_node?: Record<string, any>;
+  tool_mode?: boolean;
+}
+
+export interface StoreComponentCreate {
+  name: string;
+  description: string | null;
+  data: Record<string, any>;
+  tags: string[] | null;
+  is_component: boolean | null;
+  parent?: string;
+  last_tested_version?: string;
+  private?: boolean;
+  [key: string]: any;
+}
+
+export interface OpenAIResponsesRequest {
+  model: string;
+  input: string;
+  stream?: boolean;
+  background?: boolean;
+  previous_response_id?: string;
+  include?: string[];
+  tools?: any[];
+  [key: string]: any;
+}
+
+export interface CreateUserRequest {
+  username: string;
+  password: string;
+  optins?: Record<string, any>;
+  [key: string]: any;
+}
+
+export interface UploadFileV2Params {
+  append?: boolean;
+  ephemeral?: boolean;
+}
+
+export interface GetFileV2Params {
+  return_content?: boolean;
+}
+
+export interface CreateKnowledgeBaseRequest {
+  name: string;
+  embedding_provider: string;
+  embedding_model: string;
+  column_config?: any[];
+}
+
+export interface ListKnowledgeBaseChunksParams {
+  page?: number;
+  limit?: number;
+  search?: string;
+}
+
+export interface KnowledgeBaseFile {
+  buffer: Buffer;
+  filename?: string;
+}
+
+export interface MessageUpdate {
+  context_id?: string;
+  edit?: boolean;
+  error?: boolean;
+  files?: string[];
+  properties?: Record<string, any>;
+  sender?: string;
+  sender_name?: string;
+  session_id?: string;
+  session_metadata?: Record<string, any>;
+  text?: string;
+  [key: string]: any;
+}
+
+export interface SharedMessagesParams {
+  source_flow_id: string;
+  session_id?: string;
+  order_by?: string;
+}
+
+export interface MigrateSharedSessionParams {
+  new_session_id: string;
+  source_flow_id: string;
+}
+
+export interface ListTracesParams {
+  flow_id?: string;
+  session_id?: string;
+  status?: 'unset' | 'ok' | 'error';
+  query?: string;
+  start_time?: string;
+  end_time?: string;
+  page?: number;
+  size?: number;
+}
+
+export interface ListModelsParams {
+  provider?: string;
+  model_name?: string;
+  model_type?: string;
+  include_unsupported?: boolean;
+  include_deprecated?: boolean;
+  tool_calling?: boolean;
+  reasoning?: boolean;
+  search?: string;
+  preview?: boolean;
+  deprecated?: boolean;
+  not_supported?: boolean;
+  [key: string]: any;
+}
+
+export interface EnabledProvidersParams {
+  providers?: string[];
+}
+
+export interface EnabledModelsParams {
+  model_names?: string[];
+}
+
+export interface ModelStatusUpdate {
+  provider: string;
+  model_id: string;
+  enabled: boolean;
+}
+
+export interface DefaultModelTypeParams {
+  model_type: string;
+}
+
+export interface DefaultModelRequest {
+  provider: string;
+  model_name: string;
+  model_type: string;
+}
+
+export interface ValidateProviderRequest {
+  provider: string;
+  variables: Record<string, any>;
+}
+
+export interface ValidateProviderResponse {
+  valid: boolean;
+  error?: string;
+  [key: string]: any;
+}
+
+export interface AssistantRequest {
+  flow_id: string;
+  input_value?: string;
+  session_id?: string;
+  component_id?: string;
+  field_name?: string;
+  model_name?: string;
+  provider?: string;
+  max_retries?: number;
+}
+
+export interface GetWorkflowResultParams {
+  job_id?: string;
+}
+
+export interface RunWorkflowRequest {
+  flow_id: string;
+  inputs?: Record<string, any>;
+  stream?: boolean;
+  background?: boolean;
+  [key: string]: any;
+}
+
+export interface StopWorkflowResponse {
+  job_id: string;
+  message?: string;
+  [key: string]: any;
+}
+
+export interface ListMcpServersParams {
+  action_count?: boolean;
+}
+
+export interface MCPProjectConfigParams {
+  mcp_enabled?: boolean;
+}
+
+export interface MCPProjectUpdateRequest {
+  settings: any[];
+  auth_settings?: Record<string, any>;
+}
+
+export interface MCPInstallRequest {
+  client: string;
+  transport?: 'sse' | 'streamablehttp';
+  [key: string]: any;
+}
+
+export interface MCPServerConfigBody {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  [key: string]: any;
+}
+
+export interface WebhookEventsParams {
+  user_id?: string;
 }
