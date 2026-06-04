@@ -786,21 +786,26 @@ async def run_turn(llm, mcp, settings, tools, messages, _starter_cache, sink):
                 if tc["name"].startswith("download_") and not str(result).startswith("ERROR"):
                     try:
                         parsed = json.loads(result) if isinstance(result, str) else result
+                        # MCP returns a JSON error envelope ({"error": true, "message": ...})
+                        # on failure — surface it to the LLM, never persist it as an export.
+                        if isinstance(parsed, dict) and parsed.get("error"):
+                            raise RuntimeError(parsed.get("message") or "download failed")
                         export_dir = Path.cwd() / "exports"
                         export_dir.mkdir(exist_ok=True)
                         items = parsed if isinstance(parsed, list) else [parsed]
                         written = []
-                        for i, item in enumerate(items):
-                            if isinstance(item, dict):
-                                raw_name = str(item.get("name") or item.get("id") or tc["name"])
-                                fid = str(item.get("id") or "")[:8]
-                            else:
-                                raw_name, fid = tc["name"], str(i)
+                        for item in items:
+                            if not isinstance(item, dict) or item.get("error"):
+                                continue  # skip non-flow payloads / per-item error envelopes
+                            raw_name = str(item.get("name") or item.get("id") or tc["name"])
+                            fid = str(item.get("id") or "")[:8]
                             slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip("-") or "export"
                             fname = f"{slug}-{fid}.json" if fid else f"{slug}.json"
                             path = export_dir / fname
                             path.write_text(json.dumps(item, indent=2))
                             written.append({"name": raw_name, "path": str(path), "bytes": path.stat().st_size})
+                        if not written:
+                            raise RuntimeError("download returned no flow data")
                         console.print(f"[dim]↳ exported {len(written)} file(s) → {export_dir}[/dim]")
                         result = json.dumps({
                             "exported": written,

@@ -111,6 +111,7 @@ def slim_graph(flow: dict) -> dict | None:
 
 
 class EventSink(Protocol):
+    flow_id: str | None
     def tool_call(self, name: str, arguments: dict) -> None: ...
     def flow_built(self, flow_id: str | None, graph: dict | None = None) -> None: ...
     def flow_modified(self, graph: dict | None = None) -> None: ...
@@ -119,6 +120,8 @@ class EventSink(Protocol):
 
 class ConsoleSink:
     """No-op sink for the terminal REPL — existing console.print output is unchanged."""
+
+    flow_id: str | None = None  # no canvas in the terminal; keeps run_turn's sink.flow_id checks falsy
 
     def tool_call(self, name: str, arguments: dict) -> None:
         pass
