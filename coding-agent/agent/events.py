@@ -13,7 +13,23 @@ ConsoleSink is a no-op: the CLI already renders everything via console.print, so
 structured signals add nothing there and CLI behaviour stays identical. The web sink
 (AGUISink, in server/) maps these signals to AG-UI protocol events.
 """
+import json
 from typing import Protocol
+
+
+def _handle_field(h, key: str):
+    """Pull a field (e.g. 'name' / 'fieldName') from an edge handle that may be a dict
+    or a œ/Å-encoded JSON string (Langflow's on-disk handle format)."""
+    if isinstance(h, str):
+        for ch in ("œ", "Å"):
+            try:
+                h = json.loads(h.replace(ch, '"'))
+                break
+            except Exception:
+                continue
+    if isinstance(h, dict):
+        return h.get(key)
+    return None
 
 
 def _stringify_field_value(value, secret: bool) -> str | None:
@@ -53,12 +69,64 @@ def _slim_fields(node_meta: dict) -> list:
         ftype = f.get("type") or ""
         secret = bool(f.get("password")) or ftype == "password"
         out.append({
+            "key": fname,  # real template key — the canvas needs it to write values back
             "name": f.get("display_name") or fname,
             "type": ftype,
             "value": _stringify_field_value(f.get("value"), secret),
             "secret": secret,
         })
     return out
+
+
+def _slim_inputs(node_meta: dict) -> list:
+    """Connectable input fields (those carrying input_types) → target handles on the canvas.
+
+    Schema-driven: a template field is a connection target iff Langflow gave it input_types
+    AND its widget renders an edge port. `_input_type == 'ModelInput'` is a dropdown-only
+    widget with no port — Langflow stores but strips/ignores edges to it (e.g. Agent.model),
+    so it is excluded to match what the real Langflow canvas shows.
+    `key` is the template key the edge's targetHandle.fieldName must reference.
+    """
+    tmpl = node_meta.get("template")
+    if not isinstance(tmpl, dict):
+        return []
+    out = []
+    for fname, f in tmpl.items():
+        if fname in ("code", "_type") or not isinstance(f, dict):
+            continue
+        if f.get("show") is False:
+            continue
+        if f.get("_input_type") == "ModelInput":  # dropdown-only, no edge port
+            continue
+        its = f.get("input_types")
+        if not its:
+            continue
+        out.append({
+            "key": fname,
+            "name": f.get("display_name") or fname,
+            "input_types": its,
+        })
+    return out
+
+
+def _slim_outputs(node_meta: dict) -> list:
+    """Component outputs → source handles on the canvas. `name` is the sourceHandle.name."""
+    outs = node_meta.get("outputs")
+    if not isinstance(outs, list):
+        return []
+    res = []
+    for o in outs:
+        if not isinstance(o, dict):
+            continue
+        name = o.get("name")
+        if not name:
+            continue
+        res.append({
+            "name": name,
+            "display": o.get("display_name") or name,
+            "types": o.get("types") or [],
+        })
+    return res
 
 
 def slim_graph(flow: dict) -> dict | None:
@@ -85,9 +153,13 @@ def slim_graph(flow: dict) -> dict | None:
             # Note nodes carry their text in description, not a template.
             label = node_meta.get("description") or "Note"
             fields = []
+            inputs: list = []
+            outputs: list = []
         else:
             label = node_meta.get("display_name") or ntype or n["id"]
             fields = _slim_fields(node_meta)
+            inputs = _slim_inputs(node_meta)
+            outputs = _slim_outputs(node_meta)
         pos = n.get("position") or {}
         nodes_out.append({
             "id": n["id"],
@@ -95,6 +167,8 @@ def slim_graph(flow: dict) -> dict | None:
             "label": label,
             "type": ntype,
             "fields": fields,
+            "inputs": inputs,
+            "outputs": outputs,
         })
     edges_out = []
     for e in data.get("edges", []) or []:
@@ -104,6 +178,10 @@ def slim_graph(flow: dict) -> dict | None:
             "id": e.get("id") or f"{e['source']}->{e['target']}",
             "source": e["source"],
             "target": e["target"],
+            # Handle ids so the canvas attaches each edge to the right per-field handle
+            # (source output name / target template key) when a node has several handles.
+            "sourceHandle": _handle_field(e.get("sourceHandle"), "name"),
+            "targetHandle": _handle_field(e.get("targetHandle"), "fieldName"),
         })
     if not nodes_out and not edges_out:
         return None

@@ -43,6 +43,7 @@ from mcpbridge.redis_cache import RedisEntityCache
 from llm.registry import get_provider
 from agent.agent import run_turn
 from agent.events import slim_graph
+from server.canvas import apply_canvas_ops
 
 logger = logging.getLogger("agent.server")
 
@@ -248,6 +249,32 @@ async def agent_endpoint(request: Request):
             ))
 
     return StreamingResponse(event_stream(), media_type=encoder.get_content_type())
+
+
+@app.post("/canvas/mutate")
+async def canvas_mutate(request: Request):
+    """Persist direct canvas edits (drag/field/edge/node) for a thread's flow.
+
+    Body: {thread_id, ops:[{op, ...}], flow_id?}. Resolves flow_id from the thread (the
+    same map the chat agent populates) so the browser need only send the thread id.
+    Returns {graph: <slim_graph>} for the canvas to reconcile against.
+    """
+    body = await request.json()
+    thread_id = body.get("thread_id") or ""
+    ops = body.get("ops") or []
+    flow_id = _THREAD_FLOW.get(thread_id) or body.get("flow_id")
+    if not flow_id:
+        return {"error": "no flow for thread"}
+    if not isinstance(ops, list) or not ops:
+        return {"error": "no ops"}
+
+    mcp = request.app.state.mcp
+    try:
+        graph = await apply_canvas_ops(mcp, flow_id, ops)
+    except Exception as e:
+        logger.exception("canvas mutate failed")
+        return {"error": str(e)}
+    return {"graph": graph}
 
 
 @app.get("/health")
