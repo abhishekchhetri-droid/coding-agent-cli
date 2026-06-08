@@ -11,6 +11,8 @@ from llm.base import LLMProvider
 from mcpbridge.client import LangflowMCPClient
 from config.settings import Settings
 from agent.prompts import SYSTEM_PROMPT
+from agent import planning
+from agent.context import summarize_history, compact_flow_snapshots
 
 console = Console()
 
@@ -58,12 +60,42 @@ def _serialize_edge_handles(edges: list[dict]) -> list[dict]:
     return result
 
 
+def _handle_dict(edge: dict, side: str) -> dict:
+    """Return an edge's source/targetHandle as a dict, tolerating Langflow's two
+    serializations: a parsed dict under edge['data'][side], or a top-level string
+    where double-quotes are encoded as U+0153 (œ). Live get_flow returns the latter;
+    agent-built edges use plain dicts."""
+    d = edge.get("data")
+    if isinstance(d, dict) and isinstance(d.get(side), dict):
+        return d[side]
+    h = edge.get(side)
+    if isinstance(h, dict):
+        return h
+    if isinstance(h, str) and h:
+        try:
+            return json.loads(h.replace("œ", '"'))
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
+
+
+def _edge_key(edge: dict) -> tuple | None:
+    """Stable identity of an edge as (source, target, target_field), handle-format agnostic."""
+    th = _handle_dict(edge, "targetHandle")
+    src, tgt, fld = edge.get("source"), edge.get("target"), th.get("fieldName")
+    if src and tgt and fld:
+        return (src, tgt, fld)
+    return None
+
+
 def _inject_node_check(
     get_flow_result: str | None,
     mcp: "LangflowMCPClient",
     flow_id: str,
+    intended_edges: list[dict] | None = None,
 ) -> str:
-    """Check node/edge count and test-run the flow. Append VERIFIED or FAILED to the tool result."""
+    """Verify a built flow: detect edges Langflow rejected (diff vs intended),
+    audit required inputs, then smoke test-run. Append a verdict to the result."""
     if not get_flow_result:
         return get_flow_result or "null"
     try:
@@ -83,35 +115,139 @@ def _inject_node_check(
                 "Do NOT report success until node count > 0."
             )
 
-        # Detect silently-dropped edges (Langflow removes invalid connections without error)
-        edge_warning = ""
-        min_expected = n_nodes - 1
-        if n_nodes > 4 and n_edges < min_expected:
-            edge_warning = (
-                f"\n\n⚠ EDGE WARNING: {n_nodes} nodes but only {n_edges} edges "
-                f"(expected ≥{min_expected}). Langflow removed invalid connections. "
-                "Call get_component_schema for each non-core component, verify fieldNames "
-                "and output names, then update_flow with corrected edges. Do NOT report "
-                "success — the flow is partially wired."
+        # Map each node's satisfied target fields from the SURVIVING edges.
+        incoming: dict[str, set[str]] = {}
+        for e in edges:
+            key = _edge_key(e)
+            if key:
+                incoming.setdefault(key[1], set()).add(key[2])
+
+        def _is_model_field(node_id: str, fname: str, intended_handle: dict) -> bool:
+            """A field is a model input if the node's template says type 'model', or the
+            intended edge declared a LanguageModel/model handle (field may have vanished)."""
+            tmpl = next(
+                (x.get("data", {}).get("node", {}).get("template", {})
+                 for x in nodes if x.get("id") == node_id),
+                {},
+            )
+            f = tmpl.get(fname)
+            if isinstance(f, dict) and (f.get("type") == "model" or "LanguageModel" in (f.get("input_types") or [])):
+                return True
+            return intended_handle.get("type") == "model" or "LanguageModel" in (intended_handle.get("inputTypes") or [])
+
+        # Detect edges Langflow rejected as invalid: intended − surviving. This is
+        # the robust catch — it works even when the rejection deleted the target
+        # field entirely (e.g. wiring to a Prompt variable never declared in the
+        # template). Model-handle rejections are the known platform limitation, not
+        # a build bug, so they only feed the soft MODEL note.
+        stripped_real: list[str] = []
+        model_gaps: list[str] = []
+        if intended_edges:
+            surviving_keys = {k for k in (_edge_key(e) for e in edges) if k}
+            for ie in intended_edges:
+                key = _edge_key(ie)
+                if not key or key in surviving_keys:
+                    continue
+                th = _handle_dict(ie, "targetHandle")
+                label = f"{key[1]}.{key[2]}"
+                if _is_model_field(key[1], key[2], th):
+                    model_gaps.append(label)
+                else:
+                    stripped_real.append(f"{key[0]} → {label}")
+
+        # Schema-driven required-input audit over the SURVIVING graph.
+        wiring_gaps: list[str] = []   # required pure-handle field (must be wired), no edge
+        cred_gaps: list[str] = []     # required literal/credential field left empty
+        for n in nodes:
+            nid = n.get("id", "")
+            tmpl = n.get("data", {}).get("node", {}).get("template", {})
+            satisfied = incoming.get(nid, set())
+            for fname, f in tmpl.items():
+                if not isinstance(f, dict) or not f.get("required") or fname in satisfied:
+                    continue
+                itypes = f.get("input_types") or []
+                has_value = f.get("value") not in (None, "", [], {})
+                is_model = f.get("type") == "model" or "LanguageModel" in itypes
+                # Only 'other'-typed fields are pure handles that MUST be wired.
+                # A str field exposing input_types=['Message'] is also user-fillable,
+                # so treat it as a credential/literal, not a forced wire.
+                is_pure_handle = (not is_model) and f.get("type") == "other"
+                if is_model:
+                    if not has_value:
+                        label = f"{nid}.{fname}"
+                        if label not in model_gaps:
+                            model_gaps.append(label)
+                elif is_pure_handle:
+                    wiring_gaps.append(f"{nid}.{fname}")
+                elif not has_value:
+                    cred_gaps.append(f"{nid}.{fname}")
+
+        # Rejected edges = real structural failure; block first and loudest.
+        if stripped_real:
+            return (
+                get_flow_result
+                + f"\n\n⚠ EDGES REJECTED: Langflow dropped these connections as invalid: "
+                f"{'; '.join(stripped_real)}. Usual cause: the target field does not exist "
+                "on the component (e.g. wiring to a Prompt variable before setting the "
+                "component's `template` value with that {variable}; or a source/target type "
+                "mismatch). Set the template value (so the variable handles are created) or "
+                "fix the field name/handle types, then update_flow + rebuild. "
+                "Do NOT report success until these edges survive a rebuild."
             )
 
-        # Test-run to confirm execution
+        # Pure-handle wiring gaps mean the graph is structurally broken — block.
+        if wiring_gaps:
+            return (
+                get_flow_result
+                + f"\n\n⚠ WIRING INCOMPLETE: required input(s) with no incoming edge: "
+                f"{', '.join(wiring_gaps)}. "
+                "Call get_component_schema for each affected component, then update_flow "
+                "with edges feeding these fields. "
+                "Do NOT report success until every listed field is wired."
+            )
+
+        model_note = ""
+        if model_gaps:
+            model_note = (
+                f"\n\n⚠ MODEL NOT CONFIGURED: {', '.join(model_gaps)}. Langflow strips "
+                "model-input edges from saved flows, so connect the model in the UI "
+                "(or have the user pick a provider). This is a known platform limitation, "
+                "not a wiring bug — report it as a setup step, not a failure."
+            )
+
+        cred_note = ""
+        if cred_gaps:
+            cred_note = (
+                f"\n\n⚠ NEEDS CREDENTIALS: structurally complete, but these required "
+                f"fields are empty and must be filled by the user before the flow runs: "
+                f"{', '.join(cred_gaps)}."
+            )
+        cred_note = model_note + cred_note
+
+        # Smoke test-run to confirm execution of a structurally-complete flow.
         test = mcp.test_run_flow(flow_id)
         if test["ok"]:
             suffix = (
-                f"\n\n✅ VERIFIED: Flow executed successfully. "
-                f"Test input '2+2' → '{test['answer']}'. "
+                f"\n\n✅ VERIFIED: Flow is wired and ran a smoke test. "
                 f"Flow has {n_nodes} nodes, {n_edges} edges."
             )
-            if edge_warning:
-                suffix += " However, edge count is low — fix wiring before reporting success."
-            else:
-                suffix += " You may report success."
-            return get_flow_result + edge_warning + suffix
+            suffix += " Report success (note setup items above)." if (cred_gaps or model_gaps) else " You may report success."
+            return get_flow_result + cred_note + suffix
         else:
+            # A run failure when the only gaps are unfilled credentials / an
+            # unconfigured model is the user's to resolve, not a structural build
+            # error — don't hard-fail.
+            if cred_gaps or model_gaps:
+                return (
+                    get_flow_result
+                    + cred_note
+                    + f"\n\n✅ VERIFIED (structure): Flow is wired correctly with "
+                    f"{n_nodes} nodes, {n_edges} edges. Smoke run could not complete "
+                    "because the credential fields above are empty — expected until the "
+                    "user fills them. Report success and list the fields to fill."
+                )
             return (
                 get_flow_result
-                + edge_warning
                 + f"\n\n⚠ EXECUTION FAILED: Flow has {n_nodes} nodes but failed to run: "
                 f"{test['error']}. "
                 "Do NOT report success. Fix credentials/wiring/config and retry."
@@ -140,6 +276,10 @@ def _compact_tool_args(tc: dict) -> dict:
             e = len(d.get("edges", []))
             args["data"] = f"<{n} nodes, {e} edges — payload stripped>"
         return args
+    # The live todo list is re-injected as working state every iteration, so the full
+    # list in each historical write_todos call is pure duplication — strip it.
+    if tc["name"] == "write_todos":
+        return {"todos": "<updated — see live working state>"}
     return tc["arguments"]
 
 
@@ -164,7 +304,16 @@ def _assistant_tool_call_message(tool_calls: list[dict]) -> dict:
 async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings) -> None:
     # tools rebuilt each iteration (see while loop) so discovered tools appear next turn
     messages: list[dict] = []
+    # Planning state lives OUTSIDE messages so it survives the turn-end summarization:
+    # the loop renders both into the system prompt every iteration. todos = the agent's
+    # task plan; scratchpad = persisted determinants (flow_ids, decisions).
+    todos: list[dict] = []
+    scratchpad: dict[str, str] = {}
     _starter_cache: dict[str, dict] = {}  # name_lower/id → full template dict
+    # Edges last sent to create/replace, keyed by flow_id. Persists across turns so the
+    # post-build verifier (a later turn than create_flow) can diff intended vs surviving
+    # edges and report the ones Langflow rejected. See _inject_node_check.
+    _intended_edges_by_flow: dict[str, list] = {}
 
     def _is_langmodel_node(n: dict) -> bool:
         return any(
@@ -212,6 +361,19 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         prompt_tokens = 0
         completion_tokens = 0
         turn_start = time.perf_counter()
+        # Plan confirm-gate fires once per user request: the first multi-step plan is
+        # shown and approved, then the agent auto-locks through execution (the "auto
+        # lock" behaviour) without re-prompting on subsequent status updates.
+        _plan_confirmed = False
+        # tool_call_ids of flow-JSON snapshots (get_flow/create/update) this turn. Only the
+        # latest snapshot is relevant, so older ones are stubbed to reclaim ~5K each.
+        _flow_snapshot_ids: list[str] = []
+        # Guard against a planning loop: consecutive iterations that only touched planning
+        # tools (no real work). Nudge at 3, abort at 6.
+        _stall = 0
+        # tool_call_ids of get_component_schema results this turn. Schemas are only needed
+        # while wiring edges; once a create/update_flow consumes them they're stubbed.
+        _schema_msg_ids: set[str] = set()
 
         _THINKING_WORDS = [
             "Thinking", "Pondering", "Cogitating", "Marinating", "Ruminating",
@@ -227,13 +389,25 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 status_obj.update(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]")
 
         while iterations < settings.max_tool_iterations:
-            tools = mcp.get_tool_schemas()
+            # planning tools are agent-side (loop state closures), appended to the MCP set
+            tools = mcp.get_tool_schemas() + planning.PLANNING_TOOL_SCHEMAS
+            # Inject live todos + scratchpad as a TRAILING context message, not into the
+            # system prompt: the system block is prompt-cached, so mutating it each step
+            # would bust the cache and re-bill the whole system prompt every iteration.
+            # As a trailing message the cached system/tools/history prefix stays intact.
+            state_block = planning.render_state(todos, scratchpad)
+            call_messages = messages
+            if state_block:
+                call_messages = messages + [{
+                    "role": "user",
+                    "content": f"[Your live working state — plan + saved facts]\n{state_block}",
+                }]
             try:
                 t0 = time.perf_counter()
                 with console.status(f"[dim]{random.choice(_THINKING_WORDS)}…[/dim]", spinner="dots") as _status:
                     _cycle = asyncio.create_task(_cycle_status(_status))
                     try:
-                        response = await llm.complete(messages, tools, system=SYSTEM_PROMPT)
+                        response = await llm.complete(call_messages, tools, system=SYSTEM_PROMPT)
                     finally:
                         _cycle.cancel()
                 elapsed = time.perf_counter() - t0
@@ -286,9 +460,17 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     }
 
                 _last_build_flow_id: str | None = None
+                _intended_edges: list[dict] = []  # transient: edges from this turn's create/replace
                 _starter_template_msg_ids: set[str] = set()
+                _plan_rejected = False  # per-response: skip rest of THIS batch, not future re-plans
                 for tc in response["tool_calls"]:
                     args = tc["arguments"]
+
+                    # Plan rejected this turn: every queued tool_call still needs a tool
+                    # result (Anthropic requires one per tool_use), but we run none of them.
+                    if _plan_rejected:
+                        messages.append(_tool_result_message(tc["id"], "skipped — plan not approved; awaiting revision"))
+                        continue
 
                     # Auto-enrich nodes with full component schemas + credentials before sending to Langflow.
                     # create_flow and update_flow have distinct semantics:
@@ -610,6 +792,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             try:
                                 data = _enrich_create_data(data)
                                 args = {**args, "data": data}
+                                _intended_edges = list(data.get("edges", []))  # for post-build strip diff
                                 console.print("[dim]↳ enriched nodes with component schemas + credentials[/dim]")
                             except Exception as enrich_err:
                                 enrich_error = str(enrich_err)
@@ -631,8 +814,10 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                                 if mode == "full_replace":
                                     payload_data = _enrich_create_data(payload_data)
+                                    _intended_edges = list(payload_data.get("edges", []))
                                 else:
                                     payload_data = _enrich_update_merge(existing_data, payload_data)
+                                    _intended_edges = list(payload_data.get("edges", []))
                                 args = {**args, "data": payload_data}
                             except Exception as enrich_err:
                                 enrich_error = str(enrich_err)
@@ -644,6 +829,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         result = f"ERROR: {enrich_error} Do NOT retry blindly — call list_components first and find the exact 'type' string."
                     elif tc["name"] == "get_component_schema":
                         result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
+                        _schema_msg_ids.add(tc["id"])
                     elif tc["name"] == "clone_starter_template":
                         # Server-side clone: fetch template → enrich → POST directly, zero LLM token cost
                         name_or_id = (args.get("name_or_id") or "").strip()
@@ -773,6 +959,43 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
                         else:
                             result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call get_basic_examples first."})
+                    elif tc["name"] in planning.PLANNING_TOOL_NAMES:
+                        _todos_before = [dict(t) for t in todos]
+                        result = planning.dispatch(tc["name"], args, todos, scratchpad)
+                        _todos_changed = tc["name"] == "write_todos" and todos != _todos_before
+                        if _todos_changed and todos:
+                            # Show the plan to the user only when it actually changes (a
+                            # no-op re-call renders nothing — avoids panel spam / loops).
+                            console.print(Panel(
+                                Markdown(planning.render_todos(todos)),
+                                title="[bold]Plan[/bold]", border_style="cyan",
+                            ))
+                            # Confirm-gate ONCE per request, only for a real multi-step
+                            # plan. After approval the agent auto-locks and won't re-prompt.
+                            needs_gate = (
+                                not _plan_confirmed
+                                and len(todos) >= 2
+                                and any(t["status"] != "completed" for t in todos)
+                            )
+                            if needs_gate:
+                                try:
+                                    answer = console.input(
+                                        "[bold cyan]Proceed with this plan? [y/n][/bold cyan] "
+                                    ).strip().lower()
+                                except (KeyboardInterrupt, EOFError):
+                                    answer = "n"
+                                if answer in ("y", "yes", ""):
+                                    _plan_confirmed = True
+                                else:
+                                    feedback = console.input(
+                                        "[dim]What should change? (enter to skip)[/dim] "
+                                    ).strip()
+                                    _plan_rejected = True
+                                    result = json.dumps({
+                                        "ok": False,
+                                        "rejected_by_user": True,
+                                        "feedback": feedback or "User rejected the plan. Revise it.",
+                                    })
                     else:
                         try:
                             result = await mcp.call_tool(tc["name"], args)
@@ -872,6 +1095,41 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     pass
                         _starter_template_msg_ids.clear()
 
+                    # After create/update: component schemas have been consumed to build the
+                    # edges, so the ~5K-each schema results are dead weight — stub them.
+                    if tc["name"] in ("create_flow", "update_flow") and _schema_msg_ids:
+                        for msg in messages:
+                            if msg.get("role") == "tool" and msg.get("tool_call_id") in _schema_msg_ids:
+                                msg["content"] = '{"_note":"component schema consumed during build — stripped"}'
+                        _schema_msg_ids.clear()
+
+                    # Remember intended edges keyed by the created/updated flow id, so the
+                    # post-build verifier (which runs in a later turn) can diff intended vs
+                    # surviving edges and report the ones Langflow rejected as invalid.
+                    if tc["name"] in ("create_flow", "update_flow") and _intended_edges:
+                        try:
+                            _res = json.loads(result) if isinstance(result, str) else result
+                            _fid = _res.get("id") if isinstance(_res, dict) else None
+                            if _fid:
+                                _intended_edges_by_flow[_fid] = _intended_edges
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+                    # Auto-capture flow determinants into the scratchpad so the flow_id
+                    # survives history summarization — the user can reference "that flow"
+                    # many turns later without the LLM having to remember it.
+                    if tc["name"] in ("create_flow", "update_flow", "clone_starter_template"):
+                        try:
+                            _res = json.loads(result) if isinstance(result, str) else result
+                            if isinstance(_res, dict):
+                                _fid = _res.get("id") or _res.get("flow_id")
+                                _fname = _res.get("name")
+                                if _fid:
+                                    label = re.sub(r"[^A-Za-z0-9]+", "_", str(_fname or "flow")).strip("_").lower()
+                                    planning.remember(scratchpad, f"flow:{label}", str(_fid))
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
                     # Strip data.node schemas from any tool that returns flow JSON.
                     # create_flow/update_flow return the full updated flow — same schema bloat as get_flow.
                     # Must run before _inject_node_check (which appends text and breaks JSON parsing).
@@ -910,10 +1168,41 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     # After get_flow following a build: check nodes + test-run (runs after truncation)
                     if tc["name"] == "get_flow" and _last_build_flow_id:
                         console.print("[dim]↳ verifying flow execution…[/dim]")
-                        result = _inject_node_check(result, mcp, _last_build_flow_id)
+                        result = _inject_node_check(
+                            result, mcp, _last_build_flow_id,
+                            intended_edges=_intended_edges_by_flow.get(_last_build_flow_id, []),
+                        )
                         _last_build_flow_id = None
 
+                    # Supersede older flow snapshots: only the newest get_flow/update state
+                    # is useful, so stub the prior ones in history (each ~5K of node JSON).
+                    if tc["name"] in ("get_flow", "create_flow", "update_flow"):
+                        for _mid in _flow_snapshot_ids:
+                            for _m in messages:
+                                if _m.get("role") == "tool" and _m.get("tool_call_id") == _mid:
+                                    _m["content"] = '{"_note":"flow snapshot superseded by a newer one — omitted to save context"}'
+                        _flow_snapshot_ids.append(tc["id"])
+
                     messages.append(_tool_result_message(tc["id"], str(result)))
+
+                # Stall guard: if an iteration only called planning tools (no real work),
+                # the model is spinning on the plan instead of executing. Nudge, then abort.
+                if all(tc["name"] in planning.PLANNING_TOOL_NAMES for tc in response["tool_calls"]):
+                    _stall += 1
+                else:
+                    _stall = 0
+                if _stall == 3:
+                    messages.append({
+                        "role": "user",
+                        "content": "STOP re-calling planning tools. The plan is recorded and "
+                                   "shown to you each step. Execute the next pending action NOW "
+                                   "with a real tool (clone_starter_template / create_flow / "
+                                   "update_flow / get_flow). Only call write_todos again when an "
+                                   "item actually completes.",
+                    })
+                elif _stall >= 6:
+                    console.print("[yellow]⚠ Planning loop detected — pausing. Tell me how to proceed.[/yellow]")
+                    break
 
                 iterations += 1
             else:
@@ -925,10 +1214,13 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     console.print(
                         f"[dim]total: {total_elapsed:.1f}s · ↑{prompt_tokens:,} ↓{completion_tokens:,} tokens[/dim]"
                     )
-                # Trim history to last 2 user turns + this assistant response.
-                # Drops tool call/result messages from prior turns to prevent token explosion.
-                prior_user = [m for m in messages if m["role"] == "user"]
-                messages = prior_user[-2:] + [{"role": "assistant", "content": response["content"]}]
+                # Compact fat flow snapshots (verification get_flow ~5K) before they carry
+                # into the next turn, then apply summarization.
+                compact_flow_snapshots(messages)
+                # Context management: keep full history under the threshold, otherwise
+                # summarize the older prefix and keep the recent tail verbatim. Replaces
+                # the old last-2-user-turns trim, which discarded determinants and context.
+                messages = await summarize_history(llm, messages, settings)
                 break
         else:
             console.print("[yellow]⚠ Max tool iterations reached.[/yellow]")

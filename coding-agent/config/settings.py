@@ -40,5 +40,11 @@ class Settings(BaseSettings):
     redis_sync_interval: int = Field(default=60, validation_alias="REDIS_SYNC_INTERVAL")
     entity_top_k: int = Field(default=15, validation_alias="ENTITY_TOP_K")
 
-    # Agent behaviour
-    max_tool_iterations: int = 15
+    # Agent behaviour. Headroom for large multi-node flows; the ceiling is a
+    # safety stop, not the normal path — topology-first planning + batched
+    # schema fetch keep real builds well under it.
+    max_tool_iterations: int = 25
+
+    # Context management. Below this message count the full history is kept verbatim;
+    # above it, the older prefix is summarized at turn end (see agent/context.py).
+    summarize_threshold_messages: int = 30
