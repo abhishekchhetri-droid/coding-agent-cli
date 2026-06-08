@@ -151,6 +151,14 @@ class LangflowMCPClient:
         self._schema_display_index = {}
         return flat
 
+    def is_legacy(self, type_name: str) -> bool:
+        """True if the component is flagged legacy in the live /api/v1/all schema.
+        Resolves display-name/casing variants first so the hard-block can't be bypassed by
+        spelling (e.g. "Natural Language to SQL" → SQLGenerator). Schema-driven, no blocklist."""
+        schemas = self._fetch_component_schemas()
+        schema = schemas.get(self._resolve_type(type_name, schemas))
+        return bool(schema.get("legacy")) if isinstance(schema, dict) else False
+
     def _resolve_type(self, raw_type: str, schemas: dict) -> str:
         """Dynamically resolve a type string to the canonical schema key.
         Tries exact → case-insensitive → display_name match → best prefix match.
@@ -970,8 +978,12 @@ class LangflowMCPClient:
     def get_component_schema(self, type_name: str) -> dict:
         """Return compact schema (inputs + outputs) for one component. Uses cached /api/v1/all data."""
         schemas = self._fetch_component_schemas()
-        if type_name not in schemas:
+        # Resolve display names / casing variants ("SQL Database" → "SQLComponent",
+        # "Prompt Template" → "Prompt") so callers don't have to guess the exact key.
+        resolved = self._resolve_type(type_name, schemas)
+        if resolved not in schemas:
             return {"error": f"Unknown type: {type_name!r}. Call list_components to find the exact type string."}
+        type_name = resolved
         schema = schemas[type_name]
         tmpl = schema.get("template", {})
         outputs = schema.get("outputs", [])
@@ -996,7 +1008,15 @@ class LangflowMCPClient:
             }
             for o in outputs
         ]
-        return {"type": type_name, "inputs": inputs, "outputs": outs}
+        result = {"type": type_name, "inputs": inputs, "outputs": outs}
+        # Component quality (schema-driven). legacy is hard-blocked at build time — the agent
+        # must avoid these and decompose into non-legacy primitives. Flag only when set, to
+        # keep the compact schema small.
+        if schema.get("legacy"):
+            result["legacy"] = True
+        if schema.get("beta"):
+            result["beta"] = True
+        return result
 
     def get_tool_schemas(self) -> list[dict]:
         # Stable block (baseline + virtual) is emitted first so it can be prompt-cached as a

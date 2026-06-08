@@ -12,6 +12,7 @@ from mcpbridge.client import LangflowMCPClient
 from config.settings import Settings
 from agent.prompts import SYSTEM_PROMPT
 from agent import planning
+from agent import designer
 from agent.context import summarize_history, compact_flow_snapshots
 
 console = Console()
@@ -314,6 +315,10 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
     # post-build verifier (a later turn than create_flow) can diff intended vs surviving
     # edges and report the ones Langflow rejected. See _inject_node_check.
     _intended_edges_by_flow: dict[str, list] = {}
+    # Approved flow designs from the designer sub-agent, keyed by design_ref. create_flow
+    # resolves {"_design_ref": ref} → the approved nodes/edges, so the main agent never
+    # re-emits the payload (token-lean) and the design+confirm path stays authoritative.
+    _approved_designs: dict[str, dict] = {}
 
     def _is_langmodel_node(n: dict) -> bool:
         return any(
@@ -396,7 +401,8 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
             _tool_schemas = mcp.get_tool_schemas()
             _volatile = [t for t in _tool_schemas if t.get("_volatile")]
             _stable = [t for t in _tool_schemas if not t.get("_volatile")]
-            tools = _stable + planning.PLANNING_TOOL_SCHEMAS + _volatile
+            _planning_tools = planning.PLANNING_TOOL_SCHEMAS + [designer.DESIGN_FLOW_TOOL_SCHEMA]
+            tools = _stable + _planning_tools + _volatile
             # Inject live todos + scratchpad as a TRAILING context message, not into the
             # system prompt: the system block is prompt-cached, so mutating it each step
             # would bust the cache and re-bill the whole system prompt every iteration.
@@ -486,6 +492,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     #   create: build-from-scratch, dedup structural singletons, inject hardcoded stub IDs
                     #   update: fetch existing, merge delta, preserve existing IDs (no destructive dedup)
                     enrich_error: str | None = None
+                    build_block: str | None = None
 
                     def _node_outputs_langmodel(n: dict) -> bool:
                         return any(
@@ -797,7 +804,33 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                     if tc["name"] == "create_flow":
                         data = args.get("data", {})
-                        if isinstance(data, dict) and "nodes" in data:
+                        # Resolve an approved design reference → its stored nodes/edges, so the
+                        # agent builds the confirmed design without re-emitting the payload.
+                        _from_design = isinstance(data, dict) and bool(data.get("_design_ref"))
+                        if _from_design:
+                            ref = data["_design_ref"]
+                            approved = _approved_designs.get(ref)
+                            if approved:
+                                data = dict(approved)
+                                args = {**args, "data": data}
+                                console.print(f"[dim]↳ building approved design {ref}[/dim]")
+                            else:
+                                build_block = json.dumps({
+                                    "error": "unknown_design_ref",
+                                    "note": f"No approved design {ref!r}. Call design_flow first.",
+                                })
+                        # Complex builds must go through design_flow (graph review) — enforce
+                        # the design+confirm path. Small builds + template clones stay direct.
+                        if (not build_block and not _from_design and isinstance(data, dict)
+                                and len(data.get("nodes") or []) >= 5):
+                            build_block = json.dumps({
+                                "error": "design_required",
+                                "note": "Complex builds (>=5 nodes) must go through design_flow "
+                                        "first so the user can review the graph. Call "
+                                        "design_flow(request=...), then create_flow with "
+                                        "{\"data\":{\"_design_ref\":<ref>}}.",
+                            })
+                        if not build_block and isinstance(data, dict) and "nodes" in data:
                             try:
                                 data = _enrich_create_data(data)
                                 args = {**args, "data": data}
@@ -833,9 +866,33 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 console.print(f"[red]✗ update_flow enrichment failed: {enrich_err}[/red]")
                                 console.print("[dim]↳ skipping call to prevent broken flow[/dim]")
 
+                    # Legacy hard-block (schema-driven): refuse to ship agent-authored legacy
+                    # components. Scoped to create_flow/update_flow — clone_starter_template is
+                    # Langflow-authored and exempt. Forces decomposition into modern primitives.
+                    if tc["name"] in ("create_flow", "update_flow") and not enrich_error and not build_block:
+                        _data = args.get("data") if isinstance(args.get("data"), dict) else {}
+                        _legacy = sorted({
+                            t for n in (_data.get("nodes") or [])
+                            if (t := ((n.get("data") or {}).get("type") or n.get("type")))
+                            and mcp.is_legacy(t)
+                        })
+                        if _legacy:
+                            console.print(f"[red]✗ legacy components blocked: {_legacy}[/red]")
+                            build_block = json.dumps({
+                                "error": "legacy_components",
+                                "offending": _legacy,
+                                "note": "These are legacy and hard-blocked. Rebuild from non-legacy "
+                                        "primitives — decompose any legacy mega-component into "
+                                        "explicit stages (e.g. one Prompt with {vars} → LLM → "
+                                        "executor → ChatOutput). Verify a replacement is "
+                                        "legacy:false via get_component_schema, then retry.",
+                            })
+
                     if enrich_error:
                         # Refuse to send broken nodes to Langflow. Return error as tool result so LLM retries.
                         result = f"ERROR: {enrich_error} Do NOT retry blindly — call list_components first and find the exact 'type' string."
+                    elif build_block:
+                        result = build_block
                     elif tc["name"] == "get_component_schema":
                         result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
                         _schema_msg_ids.add(tc["id"])
@@ -968,6 +1025,53 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
                         else:
                             result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call get_basic_examples first."})
+                    elif tc["name"] == "design_flow":
+                        # Delegate graph design to the in-process sub-agent (isolated context,
+                        # reuses the cached provider). Then render the graph + confirm gate.
+                        with console.status("[dim]designing flow…[/dim]", spinner="dots"):
+                            spec = await designer.design_flow(
+                                args.get("request", ""), mcp, llm, feedback=args.get("feedback"),
+                            )
+                        if spec.get("error"):
+                            result = json.dumps(spec)
+                        else:
+                            console.print(Panel(
+                                Markdown(designer.render_design(spec)),
+                                title="[bold]Proposed Design[/bold]", border_style="cyan",
+                            ))
+                            approve = _plan_confirmed
+                            if not approve:
+                                try:
+                                    answer = console.input(
+                                        "[bold cyan]Proceed with this design? [y/n][/bold cyan] "
+                                    ).strip().lower()
+                                except (KeyboardInterrupt, EOFError):
+                                    answer = "n"
+                                if answer in ("y", "yes", ""):
+                                    approve = True
+                                    _plan_confirmed = True
+                            if approve:
+                                ref = f"d{len(_approved_designs) + 1}"
+                                _approved_designs[ref] = {
+                                    "nodes": spec.get("nodes", []),
+                                    "edges": spec.get("edges", []),
+                                }
+                                result = json.dumps({
+                                    "approved": True,
+                                    "design_ref": ref,
+                                    "summary": spec.get("summary", ""),
+                                    "next": f'Build it now: call create_flow with {{"data":{{"_design_ref":"{ref}"}}}}.',
+                                })
+                            else:
+                                feedback = console.input(
+                                    "[dim]What should change? (enter to skip)[/dim] "
+                                ).strip()
+                                _plan_rejected = True
+                                result = json.dumps({
+                                    "approved": False,
+                                    "feedback": feedback or "User rejected the design. Revise it.",
+                                    "note": "Call design_flow again with this feedback.",
+                                })
                     elif tc["name"] in planning.PLANNING_TOOL_NAMES:
                         _todos_before = [dict(t) for t in todos]
                         result = planning.dispatch(tc["name"], args, todos, scratchpad)
@@ -1080,10 +1184,15 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         try:
                             components = json.loads(result) if isinstance(result, str) else result
                             if isinstance(components, list):
-                                result = json.dumps([
-                                    {"type": c.get("type"), "display_name": c.get("display_name", c.get("type"))}
-                                    for c in components
-                                ])
+                                def _entry(c):
+                                    e = {"type": c.get("type"), "display_name": c.get("display_name", c.get("type"))}
+                                    # Tag legacy (schema-driven) so component selection is
+                                    # quality-aware from the first look. Only when true — keeps
+                                    # the stripped list compact (legacy is hard-blocked at build).
+                                    if mcp.is_legacy(c.get("type")):
+                                        e["legacy"] = True
+                                    return e
+                                result = json.dumps([_entry(c) for c in components])
                         except Exception:
                             pass
 

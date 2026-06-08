@@ -217,3 +217,32 @@ def test_merge_flow_data_appends_only_new_entries():
     merged = LangflowMCPClient.merge_flow_data(existing, payload)
     assert [n["id"] for n in merged["nodes"]] == ["a", "b", "c"]
     assert [e["id"] for e in merged["edges"]] == ["e1", "e2"]
+
+
+def _client_with_schemas(schemas):
+    """Build a bare client whose component-schema cache is pre-seeded (no HTTP)."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    c._component_schema_cache = schemas
+    return c
+
+
+def test_get_component_schema_surfaces_legacy_flag():
+    """get_component_schema flags legacy components (schema-driven) and omits the key when modern."""
+    schemas = {
+        "SQLGenerator": {"legacy": True, "template": {}, "outputs": []},
+        "SQLComponent": {"legacy": False, "template": {}, "outputs": []},
+        "BetaThing": {"beta": True, "template": {}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    assert c.get_component_schema("SQLGenerator")["legacy"] is True
+    assert "legacy" not in c.get_component_schema("SQLComponent")  # modern → key omitted, stays compact
+    assert c.get_component_schema("BetaThing").get("beta") is True
+
+
+def test_is_legacy_drives_hard_block():
+    """is_legacy reads the live legacy flag; unknown types are treated as non-legacy."""
+    c = _client_with_schemas({"SQLGenerator": {"legacy": True}, "SQLComponent": {"legacy": False}})
+    assert c.is_legacy("SQLGenerator") is True
+    assert c.is_legacy("SQLComponent") is False
+    assert c.is_legacy("DoesNotExist") is False
