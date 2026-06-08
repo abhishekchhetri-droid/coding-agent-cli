@@ -217,3 +217,120 @@ def test_merge_flow_data_appends_only_new_entries():
     merged = LangflowMCPClient.merge_flow_data(existing, payload)
     assert [n["id"] for n in merged["nodes"]] == ["a", "b", "c"]
     assert [e["id"] for e in merged["edges"]] == ["e1", "e2"]
+
+
+def _client_with_schemas(schemas):
+    """Build a bare client whose component-schema cache is pre-seeded (no HTTP)."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    c._component_schema_cache = schemas
+    return c
+
+
+def test_get_component_schema_surfaces_legacy_flag():
+    """get_component_schema flags legacy components (schema-driven) and omits the key when modern."""
+    schemas = {
+        "SQLGenerator": {"legacy": True, "template": {}, "outputs": []},
+        "SQLComponent": {"legacy": False, "template": {}, "outputs": []},
+        "BetaThing": {"beta": True, "template": {}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    assert c.get_component_schema("SQLGenerator")["legacy"] is True
+    assert "legacy" not in c.get_component_schema("SQLComponent")  # modern → key omitted, stays compact
+    assert c.get_component_schema("BetaThing").get("beta") is True
+
+
+def test_is_legacy_drives_hard_block():
+    """is_legacy reads the live legacy flag; unknown types are treated as non-legacy."""
+    c = _client_with_schemas({"SQLGenerator": {"legacy": True}, "SQLComponent": {"legacy": False}})
+    assert c.is_legacy("SQLGenerator") is True
+    assert c.is_legacy("SQLComponent") is False
+    assert c.is_legacy("DoesNotExist") is False
+
+
+def _prompt_node(node_id="Prompt-1", value=""):
+    """Freshly-enriched Prompt node: bare schema, prompt field present but no var handles."""
+    return {
+        "id": node_id,
+        "type": "genericNode",
+        "data": {
+            "type": "Prompt",
+            "id": node_id,
+            "node": {
+                "template": {
+                    "_type": "Component",
+                    "template": {"type": "prompt", "value": value, "name": "template"},
+                },
+                "custom_fields": {},
+                "outputs": [],
+            },
+        },
+    }
+
+
+def _endpoint_frontend_node(template_str, vars_):
+    """Mimic /api/v1/validate/prompt: returns var fields + custom_fields, value left blank."""
+    tmpl = {"_type": "Component", "template": {"type": "prompt", "value": "", "name": "template"}}
+    for v in vars_:
+        tmpl[v] = {"name": v, "type": "str", "input_types": ["Message"], "value": "", "show": True}
+    return {"template": tmpl, "custom_fields": {"template": list(vars_)}}
+
+
+def test_apply_prompt_fields_materializes_var_handles_via_endpoint():
+    """Endpoint path: var fields + custom_fields spliced in, prompt value restored.
+    Without these the {var} input handles don't exist and inbound edges get stripped."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    tpl = "Q {question} M {metadata}"
+    c._validate_prompt = lambda fn, ts, node: _endpoint_frontend_node(ts, ["question", "metadata"])
+
+    node = _prompt_node()
+    c.apply_prompt_fields([node], tpl)
+
+    schema = node["data"]["node"]
+    assert schema["template"]["template"]["value"] == tpl  # value restored (endpoint blanks it)
+    assert "question" in schema["template"] and "metadata" in schema["template"]
+    assert schema["template"]["question"]["input_types"] == ["Message"]
+    assert schema["custom_fields"]["template"] == ["question", "metadata"]
+
+
+def test_apply_prompt_fields_falls_back_to_local_injection_when_endpoint_down():
+    """Offline fallback: vars parsed from the template and DefaultPromptField entries injected."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    c._validate_prompt = lambda fn, ts, node: None  # endpoint unreachable
+
+    node = _prompt_node(value="Hello {name}, ask {topic}")
+    c.apply_prompt_fields([node])  # no design template — uses node's own value
+
+    schema = node["data"]["node"]
+    assert schema["template"]["template"]["value"] == "Hello {name}, ask {topic}"
+    assert schema["template"]["name"]["_input_type"] == "DefaultPromptField"
+    assert schema["custom_fields"]["template"] == ["name", "topic"]
+
+
+def test_apply_prompt_fields_prefers_node_value_over_design_template():
+    """A value already on the node (LLM/clone authored) wins over the design-level template."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    captured = {}
+    def _vp(fn, ts, node):
+        captured["template_str"] = ts
+        return _endpoint_frontend_node(ts, ["own"])
+    c._validate_prompt = _vp
+
+    node = _prompt_node(value="node {own}")
+    c.apply_prompt_fields([node], "design {other}")
+    assert captured["template_str"] == "node {own}"
+
+
+def test_apply_prompt_fields_noops_without_prompt_field_or_template():
+    """Non-prompt nodes and empty prompts are left untouched (no spurious var fields)."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    c._validate_prompt = lambda *a: (_ for _ in ()).throw(AssertionError("should not be called"))
+
+    plain = {"id": "T1", "data": {"type": "TextInput", "node": {"template": {"input_value": {"type": "str"}}}}}
+    empty_prompt = _prompt_node(value="")  # no value, no design template
+    c.apply_prompt_fields([plain, empty_prompt])  # must not call endpoint or raise
+    assert "custom_fields" not in plain["data"]["node"] or not plain["data"]["node"]["custom_fields"]

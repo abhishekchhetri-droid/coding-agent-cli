@@ -162,6 +162,14 @@ class LangflowMCPClient:
         self._schema_display_index = {}
         return flat
 
+    def is_legacy(self, type_name: str) -> bool:
+        """True if the component is flagged legacy in the live /api/v1/all schema.
+        Resolves display-name/casing variants first so the hard-block can't be bypassed by
+        spelling (e.g. "Natural Language to SQL" → SQLGenerator). Schema-driven, no blocklist."""
+        schemas = self._fetch_component_schemas()
+        schema = schemas.get(self._resolve_type(type_name, schemas))
+        return bool(schema.get("legacy")) if isinstance(schema, dict) else False
+
     def _resolve_type(self, raw_type: str, schemas: dict) -> str:
         """Dynamically resolve a type string to the canonical schema key.
         Tries exact → case-insensitive → display_name match → best prefix match.
@@ -265,6 +273,88 @@ class LangflowMCPClient:
         # Auto-enable tool_mode for non-native-tool nodes feeding Agent.tools
         self._auto_tool_mode(enriched)
         return enriched
+
+    def apply_prompt_fields(self, nodes: list[dict], prompt_template: str = "") -> None:
+        """Materialize dynamic ``{var}`` input handles on Prompt-like nodes.
+
+        Langflow creates one input handle per ``{var}`` in a prompt-type field's value,
+        but only if the SAVED node carries both (a) the field value and (b) a template
+        entry + ``custom_fields`` listing for each var. A freshly enriched node has the
+        bare component schema (empty prompt value, no var fields), so any edge wired into
+        a var handle is silently dropped on load — the NL→SQL "connections were removed
+        because they were invalid" symptom.
+
+        Fully schema-driven: targets ANY field whose schema ``type == "prompt"`` (Prompt
+        Template, Cleanlab, future components), never a hardcoded component or field name.
+        The template string is taken from the node's own value if set (LLM/clone authored),
+        otherwise from the design-level ``prompt_template``. Materialization defers to
+        Langflow's own ``/api/v1/validate/prompt`` so the emitted field shapes always match
+        the running version; a local regex-based injection is the offline fallback.
+        """
+        for node in nodes:
+            schema = node.get("data", {}).get("node", {})
+            tmpl = schema.get("template", {})
+            if not isinstance(tmpl, dict):
+                continue
+            for field_name, field in list(tmpl.items()):
+                if not (isinstance(field, dict) and field.get("type") == "prompt"):
+                    continue
+                template_str = field.get("value") or prompt_template
+                if not template_str:
+                    continue
+                self._materialize_prompt_field(schema, field_name, template_str)
+
+    def _materialize_prompt_field(self, schema: dict, field_name: str, template_str: str) -> None:
+        """Inject var fields + custom_fields for one prompt-type field, then set its value."""
+        updated = self._validate_prompt(field_name, template_str, schema)
+        if updated is not None and isinstance(updated.get("template"), dict):
+            # Endpoint returns the var fields + custom_fields but leaves the prompt value
+            # blank — splice them in (keeping the rest of the enriched schema) and restore
+            # the value ourselves.
+            schema["template"] = updated["template"]
+            if "custom_fields" in updated:
+                schema["custom_fields"] = updated["custom_fields"]
+            schema["template"].setdefault(field_name, {})["value"] = template_str
+            return
+        self._inject_prompt_vars_local(schema, field_name, template_str)
+
+    def _validate_prompt(self, field_name: str, template_str: str, frontend_node: dict) -> dict | None:
+        """POST /api/v1/validate/prompt → updated frontend_node, or None if unreachable."""
+        url = f"{self._langflow_base_url}/api/v1/validate/prompt"
+        body = json.dumps(
+            {"name": field_name, "template": template_str, "frontend_node": frontend_node}
+        ).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"x-api-key": self._langflow_api_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                out = json.loads(resp.read())
+            return out.get("frontend_node")
+        except Exception as e:  # network/422/down — fall back to local injection
+            logger.warning("validate/prompt failed (%s); using local var injection", e)
+            return None
+
+    @staticmethod
+    def _inject_prompt_vars_local(schema: dict, field_name: str, template_str: str) -> None:
+        """Offline fallback mirroring Langflow's DefaultPromptField shape for each {var}."""
+        tmpl = schema.setdefault("template", {})
+        tmpl.setdefault(field_name, {})["value"] = template_str
+        seen: list[str] = []
+        for v in re.findall(r"\{\s*([a-zA-Z_]\w*)\s*\}", template_str):
+            if v not in seen and v != field_name:
+                seen.append(v)
+        for v in seen:
+            tmpl[v] = {
+                "field_type": "str", "required": False, "placeholder": "", "list": False,
+                "show": True, "multiline": True, "value": "", "fileTypes": [], "file_path": "",
+                "name": v, "display_name": v, "advanced": False, "input_types": ["Message"],
+                "dynamic": False, "info": "", "load_from_db": False, "title_case": False,
+                "type": "str", "_input_type": "DefaultPromptField",
+            }
+        schema.setdefault("custom_fields", {})[field_name] = seen
 
     def _auto_tool_mode(self, nodes: list[dict]) -> None:
         """Enable tool_mode on components that declare tool-capable inputs.
@@ -981,8 +1071,12 @@ class LangflowMCPClient:
     def get_component_schema(self, type_name: str) -> dict:
         """Return compact schema (inputs + outputs) for one component. Uses cached /api/v1/all data."""
         schemas = self._fetch_component_schemas()
-        if type_name not in schemas:
+        # Resolve display names / casing variants ("SQL Database" → "SQLComponent",
+        # "Prompt Template" → "Prompt") so callers don't have to guess the exact key.
+        resolved = self._resolve_type(type_name, schemas)
+        if resolved not in schemas:
             return {"error": f"Unknown type: {type_name!r}. Call list_components to find the exact type string."}
+        type_name = resolved
         schema = schemas[type_name]
         tmpl = schema.get("template", {})
         outputs = schema.get("outputs", [])
@@ -1007,12 +1101,25 @@ class LangflowMCPClient:
             }
             for o in outputs
         ]
-        return {"type": type_name, "inputs": inputs, "outputs": outs}
+        result = {"type": type_name, "inputs": inputs, "outputs": outs}
+        # Component quality (schema-driven). legacy is hard-blocked at build time — the agent
+        # must avoid these and decompose into non-legacy primitives. Flag only when set, to
+        # keep the compact schema small.
+        if schema.get("legacy"):
+            result["legacy"] = True
+        if schema.get("beta"):
+            result["beta"] = True
+        return result
 
     def get_tool_schemas(self) -> list[dict]:
-        active_names = self._BASELINE_TOOLS | set(getattr(self, "_discovered", ()))
-        return [
-            {
+        # Stable block (baseline + virtual) is emitted first so it can be prompt-cached as a
+        # unit. Session-discovered tools change as search_tools runs, so they go LAST and are
+        # tagged `_volatile`: the provider keeps the tool cache breakpoint on the stable block,
+        # so a changed discovered set only re-caches the volatile tail — not baseline/virtual.
+        discovered = [n for n in getattr(self, "_discovered", ()) if n not in self._BASELINE_TOOLS]
+
+        def _dict(t, volatile=False):
+            d = {
                 "type": "function",
                 "function": {
                     "name": t.name,
@@ -1020,9 +1127,13 @@ class LangflowMCPClient:
                     "parameters": t.inputSchema,
                 },
             }
-            for t in self._tools_cache
-            if t.name in active_names
-        ] + self._VIRTUAL_TOOLS
+            if volatile:
+                d["_volatile"] = True
+            return d
+
+        baseline = [_dict(t) for t in self._tools_cache if t.name in self._BASELINE_TOOLS]
+        discovered_tools = [_dict(t, volatile=True) for t in self._tools_cache if t.name in discovered]
+        return baseline + self._VIRTUAL_TOOLS + discovered_tools
 
     async def _handle_delete_node(self, args: dict) -> str:
         """Server-side node removal: get_flow → drop matched nodes + dangling edges → PATCH → build.

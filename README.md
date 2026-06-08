@@ -70,6 +70,48 @@ nokia> build a memory chatbot
 
 ---
 
+## Deploy to a VM
+
+1. Clone the repo on the VM:
+
+```bash
+git clone  ~/nokia
+cd ~/nokia
+```
+
+2. Create `.env` in `~/nokia` using `.env.example` and fill in your secrets.
+
+3. Start Langflow and Redis:
+
+```bash
+docker compose up -d
+```
+
+4. Build the MCP bridge:
+
+```bash
+cd langflow-mcp
+npm ci
+npm run build
+```
+
+5. Install Python dependencies and run the agent:
+
+```bash
+cd ../coding-agent
+uv sync
+uv run python main.py
+```
+
+6. Verify with:
+
+```bash
+curl -s localhost:7860/health
+uv run python main.py health
+```
+
+---
+
 ## How it works
 
 ```

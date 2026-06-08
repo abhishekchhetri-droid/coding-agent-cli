@@ -2,7 +2,8 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
-_ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_ENV_FILE = _REPO_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -16,7 +17,7 @@ class Settings(BaseSettings):
     langflow_api_key: str = Field(default="", validation_alias="LANGFLOW_API")
     langflow_base_url: str = "http://localhost:7860"
     langflow_mcp_path: str = Field(
-        default="/home/abhishekks1369/ai/nokia/langflow-mcp/dist/mcp/index.js",
+        default=str(_REPO_ROOT / "langflow-mcp" / "dist" / "mcp" / "index.js"),
         validation_alias="LANGFLOW_MCP_PATH",
     )
 
@@ -40,5 +41,11 @@ class Settings(BaseSettings):
     redis_sync_interval: int = Field(default=60, validation_alias="REDIS_SYNC_INTERVAL")
     entity_top_k: int = Field(default=15, validation_alias="ENTITY_TOP_K")
 
-    # Agent behaviour
-    max_tool_iterations: int = 15
+    # Agent behaviour. Headroom for large multi-node flows; the ceiling is a
+    # safety stop, not the normal path — topology-first planning + batched
+    # schema fetch keep real builds well under it.
+    max_tool_iterations: int = 25
+
+    # Context management. Below this message count the full history is kept verbatim;
+    # above it, the older prefix is summarized at turn end (see agent/context.py).
+    summarize_threshold_messages: int = 30
