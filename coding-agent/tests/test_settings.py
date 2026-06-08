@@ -17,7 +17,7 @@ def test_settings_loads_azure_vars():
         s = Settings()
         assert s.langflow_api_key == "sk-test"
         assert s.azure_openai_deployment == "gpt-4.1"
-        assert s.max_tool_iterations == 10
+        assert s.max_tool_iterations == 25
 
 
 def test_settings_defaults():
