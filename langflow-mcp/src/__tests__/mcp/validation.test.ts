@@ -142,6 +142,15 @@ describe('Validation Schemas', () => {
 
       expect(() => ListFlowsSchema.parse(invalidData)).toThrow();
     });
+
+    it('should accept remove_example_flows boolean', () => {
+      expect(() => ListFlowsSchema.parse({ remove_example_flows: true })).not.toThrow();
+      expect(() => ListFlowsSchema.parse({ remove_example_flows: false })).not.toThrow();
+    });
+
+    it('should reject non-boolean remove_example_flows', () => {
+      expect(() => ListFlowsSchema.parse({ remove_example_flows: 'yes' })).toThrow();
+    });
   });
 
   describe('GetFlowSchema', () => {

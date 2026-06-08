@@ -71,6 +71,7 @@ export interface ListFlowsParams {
   folder_id?: string;
   components_only?: boolean;
   get_all?: boolean;
+  remove_example_flows?: boolean;
 }
 
 export interface DeleteFlowsRequest {

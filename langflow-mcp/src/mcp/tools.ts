@@ -89,6 +89,7 @@ Parameters:
 - folder_id (optional, UUID string): Filter flows within a specific folder
 - components_only (optional, boolean, default: false): Return only component flows (reusable flow components)
 - get_all (optional, boolean, default: true): Retrieve all flows ignoring pagination (use with caution for large datasets)
+- remove_example_flows (optional, boolean, default: true): Exclude Langflow's read-only example/starter flows. They have no owner and 404 on delete/update, so they are hidden by default; set false only to browse templates (clone them via get_basic_examples instead)
 
 Returns: Array of FlowRead objects containing:
 - id (UUID): Unique flow identifier
@@ -146,6 +147,10 @@ Related Tools:
         get_all: {
           type: 'boolean',
           description: 'Get all flows without pagination (default: true)'
+        },
+        remove_example_flows: {
+          type: 'boolean',
+          description: 'Exclude read-only example/starter flows (default: true). These have no owner and cannot be deleted/updated; set false only to browse templates.'
         }
       }
     },

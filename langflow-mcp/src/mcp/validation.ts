@@ -38,7 +38,8 @@ export const ListFlowsSchema = z.object({
   size: z.number().int().positive().max(100, 'Page size cannot exceed 100').optional(),
   folder_id: z.string().uuid('Invalid folder ID format').optional(),
   components_only: z.boolean().optional(),
-  get_all: z.boolean().optional()
+  get_all: z.boolean().optional(),
+  remove_example_flows: z.boolean().optional()
 }).strict();
 
 export const GetFlowSchema = z.object({

@@ -496,7 +496,15 @@ export class LangflowMCPServer {
 
           case 'list_flows': {
             const validated = ListFlowsSchema.parse(args);
-            const flows = await this.client.listFlows(validated);
+            // Exclude Langflow's read-only example/starter flows by default — they
+            // have no user_id and 404 on delete/update. Bulk ops ("delete all flows")
+            // must only touch user-owned flows. Callers can override with
+            // remove_example_flows:false; starters are still reachable via
+            // get_basic_examples / list_starter_projects.
+            const flows = await this.client.listFlows({
+              remove_example_flows: true,
+              ...validated,
+            });
             return this.formatSuccessResponse(flows);
           }
 
