@@ -501,6 +501,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         )
 
                     def _enrich_create_data(data: dict) -> dict:
+                        # Approved designs carry the consolidated Prompt template separately from
+                        # the node stubs (the node only gets the bare schema at enrich time). Pull
+                        # it out here so we can materialize the {var} handles below; strip the
+                        # control keys so they never leak into the flow payload.
+                        _prompt_template = data.pop("prompt_template", "") if isinstance(data, dict) else ""
+                        data.pop("vars", None)
                         # Deduplicate structural singletons (non-LLM) by type name
                         _STRUCTURAL_SINGLETONS = {"ChatInput", "ChatOutput", "Agent"}
                         seen_singletons: set[str] = set()
@@ -594,6 +600,10 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             ]
                             for eid in extra_llm_ids:
                                 console.print(f"[yellow]↳ dedup: removed extra LLM node '{eid}'[/yellow]")
+                        # Build dynamic {var} handles on Prompt-like nodes BEFORE edge
+                        # enrichment, so enrich_edges resolves the var field types and the saved
+                        # node keeps the handles the inbound edges target.
+                        mcp.apply_prompt_fields(data["nodes"], _prompt_template)
                         data["edges"] = mcp.ensure_tool_edges(data["nodes"], data.get("edges", []))
                         if "edges" in data:
                             data["edges"] = mcp.enrich_edges(data["edges"], data["nodes"])
@@ -789,6 +799,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             console.print(f"[dim]↳ injected Agent '{stub_id}' for tool-only additions[/dim]")
 
                         merged_nodes = existing_nodes + enriched_additions
+                        # Materialize {var} handles for any newly added Prompt-like nodes (uses
+                        # the node's own template value — update payloads carry no design ref).
+                        mcp.apply_prompt_fields(enriched_additions)
                         merged_edges = existing_edges + addition_edges
                         merged_edges = mcp.ensure_tool_edges(merged_nodes, merged_edges)
                         merged_edges = mcp.enrich_edges(merged_edges, merged_nodes)
@@ -1055,6 +1068,8 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 _approved_designs[ref] = {
                                     "nodes": spec.get("nodes", []),
                                     "edges": spec.get("edges", []),
+                                    "prompt_template": spec.get("prompt_template", ""),
+                                    "vars": spec.get("vars", []),
                                 }
                                 result = json.dumps({
                                     "approved": True,
