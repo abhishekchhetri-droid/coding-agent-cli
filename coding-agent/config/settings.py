@@ -2,7 +2,8 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
-_ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_ENV_FILE = _REPO_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -16,7 +17,7 @@ class Settings(BaseSettings):
     langflow_api_key: str = Field(default="", validation_alias="LANGFLOW_API")
     langflow_base_url: str = "http://localhost:7860"
     langflow_mcp_path: str = Field(
-        default="/home/abhishekks1369/ai/nokia/langflow-mcp/dist/mcp/index.js",
+        default=str(_REPO_ROOT / "langflow-mcp" / "dist" / "mcp" / "index.js"),
         validation_alias="LANGFLOW_MCP_PATH",
     )
 

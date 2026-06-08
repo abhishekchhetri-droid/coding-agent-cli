@@ -8,4 +8,4 @@ LANGFLOW_API_KEY="${LANGFLOW_API_KEY:-$LANGFLOW_API}"
 LANGFLOW_BASE_URL="${LANGFLOW_BASE_URL:-http://localhost:7860}"
 export LANGFLOW_API_KEY LANGFLOW_BASE_URL
 
-exec node /home/abhishekks1369/ai/nokia/langflow-mcp/dist/mcp/index.js
+exec node "$(dirname "$0")/../langflow-mcp/dist/mcp/index.js"
