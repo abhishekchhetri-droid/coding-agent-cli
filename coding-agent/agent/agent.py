@@ -390,7 +390,13 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
         while iterations < settings.max_tool_iterations:
             # planning tools are agent-side (loop state closures), appended to the MCP set
-            tools = mcp.get_tool_schemas() + planning.PLANNING_TOOL_SCHEMAS
+            # Order: [stable baseline+virtual] + [stable planning] + [volatile discovered].
+            # Planning tools are stable, so they belong in the cached region ahead of the
+            # volatile discovered tail (tagged `_volatile` by get_tool_schemas).
+            _tool_schemas = mcp.get_tool_schemas()
+            _volatile = [t for t in _tool_schemas if t.get("_volatile")]
+            _stable = [t for t in _tool_schemas if not t.get("_volatile")]
+            tools = _stable + planning.PLANNING_TOOL_SCHEMAS + _volatile
             # Inject live todos + scratchpad as a TRAILING context message, not into the
             # system prompt: the system block is prompt-cached, so mutating it each step
             # would bust the cache and re-bill the whole system prompt every iteration.
@@ -401,6 +407,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 call_messages = messages + [{
                     "role": "user",
                     "content": f"[Your live working state — plan + saved facts]\n{state_block}",
+                    # Mutates every iteration: the provider keeps the cache breakpoint on the
+                    # stable history before this message so the prefix stays a cache hit.
+                    "_ephemeral": True,
                 }]
             try:
                 t0 = time.perf_counter()

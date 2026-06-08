@@ -999,9 +999,14 @@ class LangflowMCPClient:
         return {"type": type_name, "inputs": inputs, "outputs": outs}
 
     def get_tool_schemas(self) -> list[dict]:
-        active_names = self._BASELINE_TOOLS | set(getattr(self, "_discovered", ()))
-        return [
-            {
+        # Stable block (baseline + virtual) is emitted first so it can be prompt-cached as a
+        # unit. Session-discovered tools change as search_tools runs, so they go LAST and are
+        # tagged `_volatile`: the provider keeps the tool cache breakpoint on the stable block,
+        # so a changed discovered set only re-caches the volatile tail — not baseline/virtual.
+        discovered = [n for n in getattr(self, "_discovered", ()) if n not in self._BASELINE_TOOLS]
+
+        def _dict(t, volatile=False):
+            d = {
                 "type": "function",
                 "function": {
                     "name": t.name,
@@ -1009,9 +1014,13 @@ class LangflowMCPClient:
                     "parameters": t.inputSchema,
                 },
             }
-            for t in self._tools_cache
-            if t.name in active_names
-        ] + self._VIRTUAL_TOOLS
+            if volatile:
+                d["_volatile"] = True
+            return d
+
+        baseline = [_dict(t) for t in self._tools_cache if t.name in self._BASELINE_TOOLS]
+        discovered_tools = [_dict(t, volatile=True) for t in self._tools_cache if t.name in discovered]
+        return baseline + self._VIRTUAL_TOOLS + discovered_tools
 
     async def _handle_delete_node(self, args: dict) -> str:
         """Server-side node removal: get_flow → drop matched nodes + dangling edges → PATCH → build.
