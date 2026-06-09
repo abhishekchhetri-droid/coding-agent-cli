@@ -240,6 +240,30 @@ def test_get_component_schema_surfaces_legacy_flag():
     assert c.get_component_schema("BetaThing").get("beta") is True
 
 
+def test_resolve_type_disambiguates_display_name_collision():
+    """Two components whose displays collide after space-stripping ('SQL Database' vs
+    'SQLDatabase') must each resolve to their own key — not last-one-wins. General fix."""
+    schemas = {
+        "SQLComponent": {"display_name": "SQL Database", "legacy": False, "template": {}, "outputs": []},
+        "SQLDatabase": {"display_name": "SQLDatabase", "legacy": False, "template": {}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    assert c._resolve_type("SQL Database", schemas) == "SQLComponent"   # exact display (spaces kept)
+    assert c._resolve_type("SQLDatabase", schemas) == "SQLDatabase"     # case-insensitive key
+
+
+def test_resolve_type_collision_prefers_non_legacy():
+    """When a normalized display name maps to both a legacy and a modern component, the modern
+    one wins (deterministic, schema-driven)."""
+    schemas = {
+        "OldThing": {"display_name": "Cool Thing", "legacy": True, "template": {}, "outputs": []},
+        "NewThing": {"display_name": "CoolThing", "legacy": False, "template": {}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    # "cool thing" → normalized "coolthing"; both displays normalize alike → non-legacy wins.
+    assert c._resolve_type("cool_thing", schemas) == "NewThing"
+
+
 def test_is_legacy_drives_hard_block():
     """is_legacy reads the live legacy flag; unknown types are treated as non-legacy."""
     c = _client_with_schemas({"SQLGenerator": {"legacy": True}, "SQLComponent": {"legacy": False}})
@@ -322,6 +346,21 @@ def test_apply_prompt_fields_prefers_node_value_over_design_template():
     node = _prompt_node(value="node {own}")
     c.apply_prompt_fields([node], "design {other}")
     assert captured["template_str"] == "node {own}"
+
+
+def test_apply_prompt_fields_distinct_per_node():
+    """Multi-prompt pipeline: two Prompt nodes with their OWN templates materialize DIFFERENT
+    vars — not one shared template stamped on both (the 3-identical-prompts bug)."""
+    from mcpbridge.client import LangflowMCPClient
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    c._validate_prompt = lambda fn, ts, node: None  # offline → local injection from each value
+
+    intent = _prompt_node(node_id="Prompt-intent", value="Classify: {user_query}")
+    sqlgen = _prompt_node(node_id="Prompt-sqlgen", value="SQL from {schema_instructions} and {sql_pair_examples}")
+    c.apply_prompt_fields([intent, sqlgen])  # no global template — each uses its own value
+
+    assert intent["data"]["node"]["custom_fields"]["template"] == ["user_query"]
+    assert sqlgen["data"]["node"]["custom_fields"]["template"] == ["schema_instructions", "sql_pair_examples"]
 
 
 def test_apply_prompt_fields_noops_without_prompt_field_or_template():

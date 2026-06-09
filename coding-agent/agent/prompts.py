@@ -95,6 +95,15 @@ A real-world pipeline request often names stages whose component or data source 
    one-line `question` — only when its mapping is genuinely ambiguous: no single clear non-legacy
    component fits, the data source/collection is unspecified, or the provider is unspecified.
    Mark the rest `ok`. Judge ambiguity from the real component catalog, never a fixed list.
+   - **One stage = one component.** Do NOT expand a single described stage into several nodes.
+     If the user names a SPECIFIC or CUSTOM component for a stage (e.g. "an LLM Gateway
+     component", "our routing node"), map it to ONE component — a real catalog type if one
+     matches, otherwise a single `CustomComponent` placeholder — never silently turn it into a
+     Prompt+LLM (or any multi-node) subgraph. If you cannot tell whether the user means a
+     literal component or a step you should build from primitives, mark it `ask`.
+   - **Every stage must have a consumer.** If a stage's output is not used by any later stage
+     (or the final output), either route it into one or drop it — do not plan a computed-then-
+     discarded branch (e.g. classify intent but never act on it).
 2. The tool returns either open `questions` (→ **ask the user exactly those, then STOP this turn**;
    re-call `propose_pipeline` next turn with their answers folded in as `ok` stages) or
    `ready:true` with `resolved_stages`.

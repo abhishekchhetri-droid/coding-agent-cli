@@ -216,3 +216,123 @@ def test_stripped_model_edge_is_soft_not_block():
 
     assert "EDGES REJECTED" not in out
     assert "MODEL NOT CONFIGURED" in out
+
+
+def test_severed_nodes_flags_island():
+    """The NL→SQL bug: dedup removed the SQL-gen LLM, so SQLDatabase→ChatOutput became an
+    island disconnected from ChatInput. Weak-connectivity must flag both."""
+    from agent.agent import _severed_nodes
+    nodes = [
+        _node("ChatInput-1", "ChatInput", {}),
+        _node("Prompt-1", "Prompt", {}),
+        _node("SQLDatabase-1", "SQLDatabase", {}),
+        _node("ChatOutput-1", "ChatOutput", {}),
+    ]
+    edges = [
+        _edge("ChatInput-1", "Prompt-1", "user_query"),
+        _edge("SQLDatabase-1", "ChatOutput-1", "input_value", field_type="other"),  # island
+    ]
+    severed = _severed_nodes(nodes, edges)
+    assert set(severed) == {"SQLDatabase-1", "ChatOutput-1"}
+
+
+def test_severed_nodes_clean_when_connected():
+    """A fully connected chain (provider feeding forward included) has no severed nodes."""
+    from agent.agent import _severed_nodes
+    nodes = [
+        _node("ChatInput-1", "ChatInput", {}),
+        _node("Embeddings-1", "AzureOpenAIEmbeddings", {}),  # forward provider, no incoming
+        _node("Qdrant-1", "QdrantVectorStoreComponent", {}),
+        _node("ChatOutput-1", "ChatOutput", {}),
+    ]
+    edges = [
+        _edge("ChatInput-1", "Qdrant-1", "search_query"),
+        _edge("Embeddings-1", "Qdrant-1", "embedding", field_type="other"),
+        _edge("Qdrant-1", "ChatOutput-1", "input_value", field_type="other"),
+    ]
+    assert _severed_nodes(nodes, edges) == []
+
+
+def test_severed_pipeline_blocks_success():
+    """End-to-end: an island in the built flow must hard-block success in _inject_node_check."""
+    nodes = [
+        _node("ChatInput-1", "ChatInput", {}),
+        _node("Prompt-1", "Prompt", {}),
+        _node("SQLDatabase-1", "SQLDatabase", {"uri": {"required": True, "type": "str", "value": "postgres://x"}},
+              outputs=[{"name": "SQLDatabase", "types": ["SQLDatabase"]}]),
+        _node("ChatOutput-1", "ChatOutput", {}),
+    ]
+    edges = [
+        _edge("ChatInput-1", "Prompt-1", "user_query"),
+        _edge("SQLDatabase-1", "ChatOutput-1", "input_value", field_type="other"),
+    ]
+    flow = _flow(nodes, edges)
+    mcp = MagicMock()
+    mcp.test_run_flow.return_value = {"ok": True, "answer": "x", "error": ""}
+
+    out = _inject_node_check(flow, mcp, "f1")
+
+    assert "PIPELINE SEVERED" in out
+    assert "SQLDatabase-1" in out and "ChatOutput-1" in out
+    assert "VERIFIED" not in out
+
+
+def test_dead_end_producer_flagged():
+    """An LLM whose data output (Message) feeds nothing is a dead branch."""
+    from agent.agent import _dead_end_producers
+    nodes = [
+        _node("ChatInput-1", "ChatInput", {}, outputs=[{"name": "message", "types": ["Message"]}]),
+        _node("LLM-1", "AzureOpenAIModel", {}, outputs=[{"name": "text_output", "types": ["Message"]},
+                                                        {"name": "model_output", "types": ["LanguageModel"]}]),
+        _node("ChatOutput-1", "ChatOutput", {}, outputs=[{"name": "message", "types": ["Message"]}]),
+    ]
+    edges = [_edge("ChatInput-1", "ChatOutput-1", "input_value", field_type="other")]
+    assert _dead_end_producers(nodes, edges) == ["LLM-1"]
+
+
+def test_dead_end_not_flagged_when_consumed():
+    from agent.agent import _dead_end_producers
+    nodes = [
+        _node("LLM-1", "AzureOpenAIModel", {}, outputs=[{"name": "text_output", "types": ["Message"]}]),
+        _node("ChatOutput-1", "ChatOutput", {}, outputs=[{"name": "message", "types": ["Message"]}]),
+    ]
+    edges = [_edge("LLM-1", "ChatOutput-1", "input_value", field_type="other")]
+    assert _dead_end_producers(nodes, edges) == []
+
+
+def test_dead_end_model_provider_safe_via_intended():
+    """A pure model provider connects via a stripped model edge — intended edges keep it live."""
+    from agent.agent import _dead_end_producers
+    nodes = [
+        _node("AzureOpenAIModel-1", "AzureOpenAIModel", {}, outputs=[{"name": "text_output", "types": ["Message"]},
+                                                                     {"name": "model_output", "types": ["LanguageModel"]}]),
+        _node("Agent-1", "Agent", {}, outputs=[{"name": "response", "types": ["Message"]}]),
+        _node("ChatOutput-1", "ChatOutput", {}, outputs=[{"name": "message", "types": ["Message"]}]),
+    ]
+    surviving = [_edge("Agent-1", "ChatOutput-1", "input_value", field_type="other")]
+    # AzureOpenAIModel-1's only edge (model) is stripped from `surviving`; intended keeps it live.
+    intended = surviving + [_intended("AzureOpenAIModel-1", "Agent-1", "model", field_type="model")]
+    assert _dead_end_producers(nodes, surviving, extra_edges=intended) == []
+
+
+def test_dead_branch_blocks_success():
+    nodes = [
+        _node("ChatInput-1", "ChatInput", {}, outputs=[{"name": "message", "types": ["Message"]}]),
+        _node("Prompt-1", "Prompt", {}, outputs=[{"name": "prompt", "types": ["Message"]}]),
+        _node("LLM-1", "AzureOpenAIModel", {}, outputs=[{"name": "text_output", "types": ["Message"]}]),
+        _node("ChatOutput-1", "ChatOutput", {}, outputs=[{"name": "message", "types": ["Message"]}]),
+    ]
+    edges = [
+        _edge("ChatInput-1", "Prompt-1", "user_query"),
+        _edge("Prompt-1", "LLM-1", "input_value"),
+        _edge("ChatInput-1", "ChatOutput-1", "input_value", field_type="other"),
+    ]
+    flow = _flow(nodes, edges)
+    mcp = MagicMock()
+    mcp.test_run_flow.return_value = {"ok": True, "answer": "x", "error": ""}
+
+    out = _inject_node_check(flow, mcp, "f1")
+
+    assert "DEAD BRANCH" in out
+    assert "LLM-1" in out
+    assert "VERIFIED" not in out

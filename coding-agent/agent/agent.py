@@ -90,6 +90,78 @@ def _edge_key(edge: dict) -> tuple | None:
     return None
 
 
+def _node_type(n: dict) -> str:
+    return n.get("data", {}).get("type") or n.get("type", "")
+
+
+def _severed_nodes(nodes: list[dict], edges: list[dict], extra_edges: list[dict] | None = None) -> list[str]:
+    """Node ids NOT weakly-connected to the input chain — orphan islands no input can reach.
+
+    Edges are treated as UNDIRECTED: a stage is "live" if anything links it (in either
+    direction) back toward the entry, so forward producers (Embeddings → vector store) and
+    model providers (LLM → Agent.model) are not false-flagged. ``extra_edges`` (the intended
+    edges) are merged in so that model-input edges — which Langflow STRIPS from every saved
+    flow — still count for connectivity; otherwise an LLM whose only link is a model handle
+    would look severed on every agent flow. Seeds = ChatInput nodes; if a flow has none, every
+    node with no incoming edge. Catches a severed pipeline whose feeder was dropped (a same-type
+    stage removed by dedup, or an edge wired to a wrong/non-existent field): the downstream tail
+    (e.g. executor → ChatOutput) lands in its own component. A built pipeline should be one piece.
+    """
+    ids = [n.get("id", "") for n in nodes if n.get("id")]
+    if not ids:
+        return []
+    adj: dict[str, set] = {i: set() for i in ids}
+    has_incoming: set = set()
+    for e in list(edges) + list(extra_edges or []):
+        s, t = e.get("source"), e.get("target")
+        if s in adj and t in adj:
+            adj[s].add(t)
+            adj[t].add(s)
+            has_incoming.add(t)
+    seeds = [n.get("id", "") for n in nodes if _node_type(n) == "ChatInput" and n.get("id")]
+    if not seeds:
+        seeds = [i for i in ids if i not in has_incoming]
+    seen = set(seeds)
+    stack = list(seeds)
+    while stack:
+        cur = stack.pop()
+        for nb in adj.get(cur, ()):
+            if nb not in seen:
+                seen.add(nb)
+                stack.append(nb)
+    return [i for i in ids if i not in seen]
+
+
+def _dead_end_producers(nodes: list[dict], edges: list[dict], extra_edges: list[dict] | None = None) -> list[str]:
+    """Producer nodes whose DATA output is consumed by nothing — a computed-and-discarded branch
+    (e.g. an intent-classification LLM whose result feeds no downstream stage).
+
+    Schema-driven: a node is a dead-end iff it emits at least one non-tool, non-model output yet
+    appears as the source of no edge (surviving ∪ intended). ChatOutput (the terminal sink) is
+    excluded. Model providers are NOT flagged on their model output — Langflow strips model
+    edges, so connectivity there comes from ``extra_edges`` (intended); their data output being
+    idle is normal. General — no component or field names hardcoded.
+    """
+    out_sources = {e.get("source") for e in list(edges) + list(extra_edges or []) if e.get("source")}
+    dead: list[str] = []
+    for n in nodes:
+        nid = n.get("id", "")
+        if not nid or _node_type(n) == "ChatOutput":
+            continue
+        outs = n.get("data", {}).get("node", {}).get("outputs", []) or []
+        if not outs:
+            continue  # pure sink — nothing to consume
+        if all(o.get("name") in ("component_as_tool", "api_build_tool") for o in outs):
+            continue  # tool-only outputs are consumed via Agent.tools, not data edges
+        has_data_output = any(
+            any(t != "LanguageModel" for t in (o.get("types") or o.get("output_types") or []))
+            for o in outs
+        )
+        if has_data_output and nid not in out_sources:
+            dead.append(nid)
+    return dead
+
+
 def _inject_node_check(
     get_flow_result: str | None,
     mcp: "LangflowMCPClient",
@@ -207,6 +279,40 @@ def _inject_node_check(
                 "with edges feeding these fields. "
                 "Do NOT report success until every listed field is wired."
             )
+
+        # Severed pipeline: a node island unreachable from the input chain. Catches damage the
+        # intended-vs-surviving diff misses (a feeder removed BEFORE build, or an edge wired to
+        # the wrong field leaving the real port empty) — both rewrite "intent" so the diff sees
+        # nothing, but connectivity does not lie. Skipped when model gaps exist: stripped model
+        # edges are the dominant cause of apparent islands and a known platform limitation, so
+        # defer to the MODEL note (re-checked on the next rebuild once the model is configured).
+        if not model_gaps:
+            severed = _severed_nodes(nodes, edges, extra_edges=intended_edges)
+            if severed:
+                return (
+                    get_flow_result
+                    + f"\n\n⚠ PIPELINE SEVERED: these nodes are not connected to the ChatInput "
+                    f"chain: {', '.join(severed)}. A stage's feeder is missing — usually a "
+                    "same-type stage was dropped, or an edge was wired to a wrong/non-existent "
+                    "field (so the real input port is empty). Call get_component_schema for the "
+                    "affected components, confirm each edge's target field EXISTS and the source "
+                    "output type is in the target field's input_types, then update_flow to "
+                    "reconnect. Do NOT report success until every node is reachable from ChatInput."
+                )
+
+            # Dead branch: a producer whose data output feeds nothing — computed then discarded
+            # (e.g. an intent-classification LLM with no consumer). Same model-gap gate so a
+            # stripped-model provider isn't false-flagged.
+            dead = _dead_end_producers(nodes, edges, extra_edges=intended_edges)
+            if dead:
+                return (
+                    get_flow_result
+                    + f"\n\n⚠ DEAD BRANCH: these stages produce output that nothing consumes: "
+                    f"{', '.join(dead)}. Each is computed then discarded. Either wire its output "
+                    "into a downstream stage that uses it (e.g. route on a classification result), "
+                    "or remove the stage if it is not needed. Then update_flow + rebuild. "
+                    "Do NOT report success while a stage's output goes nowhere."
+                )
 
         model_note = ""
         if model_gaps:
@@ -509,28 +615,47 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             for o in n.get("data", {}).get("node", {}).get("outputs", [])
                         )
 
-                    def _enrich_create_data(data: dict) -> dict:
-                        # Approved designs carry the consolidated Prompt template separately from
-                        # the node stubs (the node only gets the bare schema at enrich time). Pull
-                        # it out here so we can materialize the {var} handles below; strip the
-                        # control keys so they never leak into the flow payload.
+                    def _enrich_create_data(data: dict, from_design: bool = False) -> dict:
+                        # ``from_design``: the build came from an approved design_flow design
+                        # (user already reviewed the exact node/edge graph). The design is
+                        # AUTHORITATIVE — skip the structural rewrites below (singleton dedup,
+                        # LLM dedup, Agent injection) that assume a single-agent build. Those
+                        # heuristics collapse legitimately-distinct same-type stages (e.g. two
+                        # LLMs: intent-classify + SQL-gen, or two vector stores), which silently
+                        # severs downstream edges and orphans the terminal nodes. Additive
+                        # enrichment (schemas, creds, prompt {var} handles, edge types) still runs.
+                        # Approved designs carry Prompt templates two ways: a PER-NODE `template`
+                        # on each Prompt stub (preferred — a multi-prompt pipeline has a distinct
+                        # template per Prompt node), and a single design-level `prompt_template`
+                        # (legacy / single-prompt fallback). Capture both and strip the control
+                        # keys so they never leak into the flow payload. Per-node templates are
+                        # applied as each node's own prompt-field value after enrichment, so
+                        # apply_prompt_fields materializes the right {vars} on the right node
+                        # instead of stamping ONE template onto every prompt (the bug that made
+                        # 3 prompts identical).
                         _prompt_template = data.pop("prompt_template", "") if isinstance(data, dict) else ""
                         data.pop("vars", None)
-                        # Deduplicate structural singletons (non-LLM) by type name
-                        _STRUCTURAL_SINGLETONS = {"ChatInput", "ChatOutput", "Agent"}
-                        seen_singletons: set[str] = set()
-                        deduped: list[dict] = []
-                        removed_ids: set[str] = set()
-                        for _n in data["nodes"]:
-                            _nt = _n.get("data", {}).get("type") or _n.get("type", "")
-                            if _nt in _STRUCTURAL_SINGLETONS and _nt in seen_singletons:
-                                removed_ids.add(_n.get("id", ""))
-                                console.print(f"[yellow]↳ dedup: removed extra '{_nt}' node[/yellow]")
-                                continue
-                            seen_singletons.add(_nt)
-                            deduped.append(_n)
-                        if removed_ids:
-                            data["nodes"] = deduped
+                        _node_templates: dict[str, str] = {}
+                        for _n in (data.get("nodes") or []):
+                            if isinstance(_n, dict) and _n.get("template"):
+                                _node_templates[_n.get("id", "")] = _n.pop("template")
+                        # Deduplicate structural singletons (non-LLM) by type name. Skip for an
+                        # approved design — it is authoritative about how many of each node exist.
+                        if not from_design:
+                            _STRUCTURAL_SINGLETONS = {"ChatInput", "ChatOutput", "Agent"}
+                            seen_singletons: set[str] = set()
+                            deduped: list[dict] = []
+                            removed_ids: set[str] = set()
+                            for _n in data["nodes"]:
+                                _nt = _n.get("data", {}).get("type") or _n.get("type", "")
+                                if _nt in _STRUCTURAL_SINGLETONS and _nt in seen_singletons:
+                                    removed_ids.add(_n.get("id", ""))
+                                    console.print(f"[yellow]↳ dedup: removed extra '{_nt}' node[/yellow]")
+                                    continue
+                                seen_singletons.add(_nt)
+                                deduped.append(_n)
+                            if removed_ids:
+                                data["nodes"] = deduped
                         # Drop orphan edges before enrichment
                         valid_node_ids = {n.get("id", "") for n in data["nodes"]}
                         orphans_before = len(data.get("edges", []))
@@ -545,7 +670,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         # Dynamic LLM dedup (post-enrichment): always keeps AzureOpenAIModel.
                         llm_nodes = [n for n in data["nodes"] if _node_outputs_langmodel(n)]
                         azure_llm = next((n for n in llm_nodes if n.get("data", {}).get("type") == "AzureOpenAIModel"), None)
-                        if not azure_llm:
+                        # Force the configured provider for hand builds only; a design's chosen
+                        # provider (and node count) is authoritative.
+                        if not from_design and not azure_llm:
                             if llm_nodes:
                                 remove_ids = {n.get("id", "") for n in llm_nodes}
                                 data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in remove_ids]
@@ -561,23 +688,26 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             )
                             azure_stub = [{"id": "AzureOpenAIModel-1", "type": "AzureOpenAIModel", "position": removed_pos, "data": {"type": "AzureOpenAIModel", "id": "AzureOpenAIModel-1"}}]
                             data["nodes"].extend(mcp.enrich_nodes(azure_stub, credential_overrides=_credential_overrides))
-                        # Wire AzureOpenAI to ALL nodes with ModelInput fields
-                        for _n in data["nodes"]:
-                            if _n.get("data", {}).get("type") == "AzureOpenAIModel":
-                                continue
-                            _mf = _find_model_field(_n)
-                            if _mf:
-                                data["edges"].append({
-                                    "source": "AzureOpenAIModel-1",
-                                    "target": _n.get("id"),
-                                    "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
-                                    "targetHandle": {"fieldName": _mf, "id": _n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
-                                })
-                        console.print("[dim]↳ wired AzureOpenAIModel → all ModelInput fields[/dim]")
-                        # Inject Agent when tool-only components exist without one
+                        # Wire AzureOpenAI to ALL nodes with ModelInput fields. Skip for an
+                        # approved design — the designer owns the wiring, and hardcoding the
+                        # source to AzureOpenAIModel-1 cross-wires a multi-LLM pipeline.
+                        if not from_design:
+                            for _n in data["nodes"]:
+                                if _n.get("data", {}).get("type") == "AzureOpenAIModel":
+                                    continue
+                                _mf = _find_model_field(_n)
+                                if _mf:
+                                    data["edges"].append({
+                                        "source": "AzureOpenAIModel-1",
+                                        "target": _n.get("id"),
+                                        "sourceHandle": {"dataType": "AzureOpenAIModel", "id": "AzureOpenAIModel-1", "name": "model_output", "output_types": ["LanguageModel"]},
+                                        "targetHandle": {"fieldName": _mf, "id": _n.get("id"), "inputTypes": ["LanguageModel"], "type": "model"},
+                                    })
+                            console.print("[dim]↳ wired AzureOpenAIModel → all ModelInput fields[/dim]")
+                        # Inject Agent when tool-only components exist without one (hand builds only)
                         _cf_has_agent = any(n.get("data", {}).get("type") == "Agent" for n in data["nodes"])
                         _cf_has_tool_only = any(_has_only_tool_outputs(n) for n in data["nodes"])
-                        if _cf_has_tool_only and not _cf_has_agent:
+                        if not from_design and _cf_has_tool_only and not _cf_has_agent:
                             _agent_stub = [{"id": "Agent-1", "type": "Agent", "position": {"x": 670, "y": 540}, "data": {"type": "Agent", "id": "Agent-1"}}]
                             data["nodes"].extend(mcp.enrich_nodes(_agent_stub, credential_overrides=_credential_overrides))
                             _ci = next((n for n in data["nodes"] if n.get("data", {}).get("type") == "ChatInput"), None)
@@ -600,7 +730,11 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     "targetHandle": {"fieldName": "input_value", "id": _co.get("id"), "inputTypes": ["Data", "JSON", "DataFrame", "Table", "Message"], "type": "other"},
                                 })
                             console.print("[dim]↳ injected Agent + wired ChatInput→Agent→ChatOutput[/dim]")
-                        if azure_llm and len(llm_nodes) > 1:
+                        # Keep ONLY one LLM for hand-built creates (the model often double-emits).
+                        # NEVER for an approved design — a multi-stage pipeline legitimately reuses
+                        # the same LLM type across distinct stages (intent-classify + SQL-gen); this
+                        # was deleting the SQL-gen LLM and orphaning the executor + ChatOutput.
+                        if not from_design and azure_llm and len(llm_nodes) > 1:
                             extra_llm_ids = {n.get("id", "") for n in llm_nodes if n is not azure_llm}
                             data["nodes"] = [n for n in data["nodes"] if n.get("id", "") not in extra_llm_ids]
                             data["edges"] = [
@@ -609,9 +743,25 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             ]
                             for eid in extra_llm_ids:
                                 console.print(f"[yellow]↳ dedup: removed extra LLM node '{eid}'[/yellow]")
+                        # Set each Prompt node's OWN template value (from its stub) onto its
+                        # prompt-type field, so apply_prompt_fields materializes that node's vars
+                        # rather than the single global template. Schema-driven: finds the prompt
+                        # field by type, never a hardcoded field/component name.
+                        if _node_templates:
+                            for _n in data["nodes"]:
+                                _t = _node_templates.get(_n.get("id", ""))
+                                if not _t:
+                                    continue
+                                _ntmpl = _n.get("data", {}).get("node", {}).get("template", {})
+                                for _f in (_ntmpl.values() if isinstance(_ntmpl, dict) else []):
+                                    if isinstance(_f, dict) and _f.get("type") == "prompt":
+                                        _f["value"] = _t
+                                        break
                         # Build dynamic {var} handles on Prompt-like nodes BEFORE edge
                         # enrichment, so enrich_edges resolves the var field types and the saved
-                        # node keeps the handles the inbound edges target.
+                        # node keeps the handles the inbound edges target. Per-node values set
+                        # above win; the design-level template is the fallback for any prompt
+                        # node without its own.
                         mcp.apply_prompt_fields(data["nodes"], _prompt_template)
                         data["edges"] = mcp.ensure_tool_edges(data["nodes"], data.get("edges", []))
                         if "edges" in data:
@@ -854,7 +1004,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             })
                         if not build_block and isinstance(data, dict) and "nodes" in data:
                             try:
-                                data = _enrich_create_data(data)
+                                data = _enrich_create_data(data, from_design=_from_design)
                                 args = {**args, "data": data}
                                 _intended_edges = list(data.get("edges", []))  # for post-build strip diff
                                 console.print("[dim]↳ enriched nodes with component schemas + credentials[/dim]")
