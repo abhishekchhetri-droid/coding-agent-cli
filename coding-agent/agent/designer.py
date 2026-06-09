@@ -139,6 +139,13 @@ DESIGN_FLOW_TOOL_SCHEMA = {
             "properties": {
                 "request": {"type": "string", "description": "The full build request / described pipeline"},
                 "feedback": {"type": "string", "description": "Optional: revision notes if redesigning after a rejection"},
+                "resolved_stages": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional: the user-aligned stage→component map returned by "
+                                   "propose_pipeline (status 'ok' stages). Pass it so the designer "
+                                   "honors the agreed components instead of re-picking.",
+                },
             },
             "required": ["request"],
         },
@@ -213,12 +220,21 @@ async def _list_components_compact(mcp) -> str:
     return json.dumps(out)
 
 
-async def design_flow(request: str, mcp, llm, feedback: str | None = None) -> dict:
+async def design_flow(request: str, mcp, llm, feedback: str | None = None,
+                      resolved_stages: list | None = None) -> dict:
     """Run the designer sub-agent. Returns the compact spec dict from submit_design, or
     {"error": ...} if it does not converge. ``feedback`` (from a rejected design) is folded
     into the opening message so the sub-agent revises rather than restarts blindly.
+    ``resolved_stages`` (from an approved propose_pipeline alignment) pins each stage's chosen
+    component/source so the designer materializes the agreed graph instead of re-guessing.
     """
     opening = f"Build request:\n{request}"
+    if resolved_stages:
+        opening += (
+            "\n\nThe user already aligned on this stage→component map. Use each stage's chosen "
+            "`component` and `source` VERBATIM — do not substitute or re-pick. Only fill wiring, "
+            "schemas, and the Prompt template/vars:\n" + json.dumps(resolved_stages, indent=2)
+        )
     if feedback:
         opening += f"\n\nThe previous design was rejected. Revise per this feedback:\n{feedback}"
     messages: list[dict] = [{"role": "user", "content": opening}]

@@ -13,6 +13,7 @@ from config.settings import Settings
 from agent.prompts import SYSTEM_PROMPT
 from agent import planning
 from agent import designer
+from agent import pipeline
 from agent.context import summarize_history, compact_flow_snapshots
 
 console = Console()
@@ -370,6 +371,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         # shown and approved, then the agent auto-locks through execution (the "auto
         # lock" behaviour) without re-prompting on subsequent status updates.
         _plan_confirmed = False
+        # True once propose_pipeline has surfaced open questions to the user this turn. When a
+        # later propose_pipeline call comes back with no open questions, the user has actually
+        # aligned the interpretation → we can auto-confirm the downstream design graph (no
+        # redundant second y/n). Without an earlier ask (all stages 'ok' first try), the design
+        # gate stays active as the sole human checkpoint.
+        _pipeline_asked = False
         # tool_call_ids of flow-JSON snapshots (get_flow/create/update) this turn. Only the
         # latest snapshot is relevant, so older ones are stubbed to reclaim ~5K each.
         _flow_snapshot_ids: list[str] = []
@@ -401,7 +408,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
             _tool_schemas = mcp.get_tool_schemas()
             _volatile = [t for t in _tool_schemas if t.get("_volatile")]
             _stable = [t for t in _tool_schemas if not t.get("_volatile")]
-            _planning_tools = planning.PLANNING_TOOL_SCHEMAS + [designer.DESIGN_FLOW_TOOL_SCHEMA]
+            _planning_tools = planning.PLANNING_TOOL_SCHEMAS + [
+                pipeline.PROPOSE_PIPELINE_TOOL_SCHEMA, designer.DESIGN_FLOW_TOOL_SCHEMA,
+            ]
             tools = _stable + _planning_tools + _volatile
             # Inject live todos + scratchpad as a TRAILING context message, not into the
             # system prompt: the system block is prompt-cached, so mutating it each step
@@ -1038,12 +1047,31 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
                         else:
                             result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call get_basic_examples first."})
+                    elif tc["name"] == "propose_pipeline":
+                        # Real-life multi-stage build: render the stage→component map, capture it
+                        # to scratchpad, and tell the model to ask the user about ambiguous stages
+                        # (or proceed to design_flow once none remain). This is the ask→loop step.
+                        stages = pipeline.normalize_stages(args.get("stages"))
+                        console.print(Panel(
+                            Markdown(pipeline.render_pipeline(stages)),
+                            title="[bold]Proposed Pipeline[/bold]", border_style="cyan",
+                        ))
+                        planning.remember(scratchpad, "pipeline", pipeline.render_pipeline(stages))
+                        resolved, open_questions = pipeline.split(stages)
+                        if open_questions:
+                            _pipeline_asked = True
+                        elif _pipeline_asked:
+                            # The user has now answered the earlier questions → interpretation is
+                            # aligned. Auto-confirm the downstream design graph (one human gate).
+                            _plan_confirmed = True
+                        result = json.dumps(pipeline.build_result(resolved, open_questions))
                     elif tc["name"] == "design_flow":
                         # Delegate graph design to the in-process sub-agent (isolated context,
                         # reuses the cached provider). Then render the graph + confirm gate.
                         with console.status("[dim]designing flow…[/dim]", spinner="dots"):
                             spec = await designer.design_flow(
                                 args.get("request", ""), mcp, llm, feedback=args.get("feedback"),
+                                resolved_stages=args.get("resolved_stages"),
                             )
                         if spec.get("error"):
                             result = json.dumps(spec)

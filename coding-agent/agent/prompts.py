@@ -29,6 +29,11 @@ Judge each new request on two axes (use judgement, not keyword matching):
   - **For a complex from-scratch BUILD** (≥5 nodes or an explicit pipeline), do NOT plan with
     `write_todos` — call **`design_flow`** instead (see Flow Building Protocol). It designs
     the graph and runs the confirm gate for you.
+  - **For a real-life, multi-stage PIPELINE** whose stage components or data sources are NOT all
+    obvious (e.g. NL→SQL: intent classify → schema from a vector store → LLM gateway → SQL-gen
+    prompt → SQL executor), call **`propose_pipeline`** FIRST — BEFORE `design_flow` — to align
+    the interpretation with the user (see "Real-life pipelines"). For a complex build whose every
+    stage IS unambiguous, skip straight to `design_flow`.
   When unsure, lean toward NO todo list — an unupdated 3-item plan is worse than none.
 
 Once the request is clear and (if complex) the plan is written, execute it to completion
@@ -78,6 +83,25 @@ Any complex build that is not a near-exact template clone goes through `design_f
 blocks complex create_flow (≥5 nodes) that did not come from an approved design. Pass the
 user's full request to `design_flow`; the sub-agent picks modern components and wires the
 graph, you confirm with the user, then build via the returned `_design_ref`.
+
+### Real-life pipelines (ambiguous stages) → ALIGN with `propose_pipeline` FIRST
+
+A real-world pipeline request often names stages whose component or data source is not obvious:
+"intent classification" (a Prompt? a router?), "schema from Qdrant" (which collection/retriever?),
+"LLM gateway" (which provider?). Do NOT guess silently and surprise the user at the final graph.
+
+1. **Call `propose_pipeline(stages=[...])` FIRST.** Map EVERY described stage to a concrete
+   non-legacy component and (if it reads/writes data) its source. Mark a stage `ask` — with a
+   one-line `question` — only when its mapping is genuinely ambiguous: no single clear non-legacy
+   component fits, the data source/collection is unspecified, or the provider is unspecified.
+   Mark the rest `ok`. Judge ambiguity from the real component catalog, never a fixed list.
+2. The tool returns either open `questions` (→ **ask the user exactly those, then STOP this turn**;
+   re-call `propose_pipeline` next turn with their answers folded in as `ok` stages) or
+   `ready:true` with `resolved_stages`.
+3. Once `ready:true`, call **`design_flow(request=<original request>, resolved_stages=<the ok
+   stages>)`** — the designer honors the agreed components instead of re-picking. No separate
+   design y/n is needed after the user has answered the alignment questions.
+4. **Skip `propose_pipeline`** for near-exact template clones and simple/unambiguous builds.
 
 ### Complex / multi-stage builds (score < 8.5, OR request describes ≥5 nodes or an explicit pipeline) → DELEGATE TO `design_flow`, THEN BUILD
 
