@@ -473,6 +473,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         prompt_tokens = 0
         completion_tokens = 0
         turn_start = time.perf_counter()
+        tool_time = 0.0  # cumulative wall-clock spent executing tools this turn (pure Python)
         # Plan confirm-gate fires once per user request: the first multi-step plan is
         # shown and approved, then the agent auto-locks through execution (the "auto
         # lock" behaviour) without re-prompting on subsequent status updates.
@@ -542,8 +543,16 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         _cycle.cancel()
                 elapsed = time.perf_counter() - t0
             except (KeyboardInterrupt, asyncio.CancelledError):
-                console.print("\n[dim]Interrupted.[/dim]")
-                return
+                console.print("\n[dim]Interrupted — back to prompt.[/dim]")
+                break  # abandon this turn only; keep the REPL (and conversation) alive
+            except Exception as e:
+                # A transient LLM/API error (timeout, dropped connection, 5xx) must NOT kill the
+                # session. The failed call appended nothing, so message history is still valid —
+                # drop back to the prompt and let the user re-send. Provider already retried.
+                console.print(f"\n[red]✗ LLM request failed:[/red] {type(e).__name__}: {e}")
+                console.print("[dim]Turn aborted — your session and context are intact. "
+                              "Re-send your last message to retry.[/dim]")
+                break
 
             iter_prompt = 0
             iter_completion = 0
@@ -595,6 +604,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 _plan_rejected = False  # per-response: skip rest of THIS batch, not future re-plans
                 for tc in response["tool_calls"]:
                     args = tc["arguments"]
+                    _tool_t0 = time.perf_counter()  # pure-Python exec timer for this tool
 
                     # Plan rejected this turn: every queued tool_call still needs a tool
                     # result (Anthropic requires one per tool_use), but we run none of them.
@@ -1218,11 +1228,20 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     elif tc["name"] == "design_flow":
                         # Delegate graph design to the in-process sub-agent (isolated context,
                         # reuses the cached provider). Then render the graph + confirm gate.
-                        with console.status("[dim]designing flow…[/dim]", spinner="dots"):
-                            spec = await designer.design_flow(
-                                args.get("request", ""), mcp, llm, feedback=args.get("feedback"),
-                                resolved_stages=args.get("resolved_stages"),
-                            )
+                        try:
+                            with console.status("[dim]designing flow…[/dim]", spinner="dots"):
+                                spec = await designer.design_flow(
+                                    args.get("request", ""), mcp, llm, feedback=args.get("feedback"),
+                                    resolved_stages=args.get("resolved_stages"),
+                                )
+                        except (KeyboardInterrupt, asyncio.CancelledError):
+                            raise
+                        except Exception as e:
+                            # The designer makes its own LLM calls; a transient timeout/error must
+                            # not crash the session. Return it as a tool result so the model can
+                            # retry design_flow, and tool_use/tool_result pairing stays intact.
+                            console.print(f"[red]✗ design_flow failed:[/red] {type(e).__name__}: {e}")
+                            spec = {"error": f"designer failed: {type(e).__name__}: {e}. Retry design_flow."}
                         if spec.get("error"):
                             result = json.dumps(spec)
                         else:
@@ -1494,6 +1513,13 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     _m["content"] = '{"_note":"flow snapshot superseded by a newer one — omitted to save context"}'
                         _flow_snapshot_ids.append(tc["id"])
 
+                    # Pure-Python per-tool execution time, shown on the same dim metrics line
+                    # style as the LLM ⏱/token/cache line. (Tools with a confirm gate include the
+                    # human y/n wait — that's real wall-clock for that step.)
+                    _tool_dt = time.perf_counter() - _tool_t0
+                    tool_time += _tool_dt
+                    console.print(f"[dim]  ⏱ exec {tc['name']} {_tool_dt:.2f}s[/dim]")
+
                     messages.append(_tool_result_message(tc["id"], str(result)))
 
                 # Stall guard: if an iteration only called planning tools (no real work),
@@ -1523,7 +1549,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 if prompt_tokens or completion_tokens:
                     total_elapsed = time.perf_counter() - turn_start
                     console.print(
-                        f"[dim]total: {total_elapsed:.1f}s · ↑{prompt_tokens:,} ↓{completion_tokens:,} tokens[/dim]"
+                        f"[dim]total: {total_elapsed:.1f}s (tools {tool_time:.1f}s · llm "
+                        f"{max(total_elapsed - tool_time, 0):.1f}s) · ↑{prompt_tokens:,} "
+                        f"↓{completion_tokens:,} tokens[/dim]"
                     )
                 # Compact fat flow snapshots (verification get_flow ~5K) before they carry
                 # into the next turn, then apply summarization.
