@@ -180,20 +180,35 @@ class LangflowMCPClient:
         # Build case-insensitive index and display_name index lazily on first mismatch
         if not hasattr(self, "_schema_lower_index") or len(self._schema_lower_index) != len(schemas):
             self._schema_lower_index: dict[str, str] = {}
-            self._schema_display_index: dict[str, str] = {}
+            self._schema_display_exact: dict[str, str] = {}   # display_name.lower() (spaces kept)
+            self._schema_display_index: dict[str, str] = {}   # normalized (spaces/_/- stripped)
+
+            def _prefer(index: dict[str, str], k: str, key: str) -> None:
+                # Deterministic on collision (two components, same (normalized) display name —
+                # e.g. "SQL Database"/SQLComponent vs "SQLDatabase"/SQLDatabase normalize alike):
+                # keep the non-legacy twin, else first seen. General, not tied to any pair.
+                prev = index.get(k)
+                if prev is None or (bool(schemas.get(prev, {}).get("legacy")) and not bool(schema.get("legacy"))):
+                    index[k] = key
+
             for key, schema in schemas.items():
                 self._schema_lower_index[key.lower()] = key
                 dn = schema.get("display_name", "")
                 if dn:
-                    self._schema_display_index[dn.lower().replace(" ", "")] = key
+                    _prefer(self._schema_display_exact, dn.lower(), key)
+                    _prefer(self._schema_display_index, dn.lower().replace(" ", ""), key)
         # 1. Case-insensitive exact match
         if lower in self._schema_lower_index:
             return self._schema_lower_index[lower]
-        # 2. Match against display_name (e.g. "Prompt Template" → "PromptTemplate")
+        # 2. Exact display_name match (spaces preserved) — disambiguates twins whose displays
+        # differ only by spacing ("SQL Database" vs "SQLDatabase") before normalization erases it.
+        if lower in self._schema_display_exact:
+            return self._schema_display_exact[lower]
+        # 3. Normalized display_name match (e.g. "prompt_template" → "PromptTemplate")
         normalized = lower.replace(" ", "").replace("_", "").replace("-", "")
         if normalized in self._schema_display_index:
             return self._schema_display_index[normalized]
-        # 3. Prefix match — find all schema keys that start with or contain the raw_type string
+        # 4. Prefix match — find all schema keys that start with or contain the raw_type string
         candidates = [k for lk, k in self._schema_lower_index.items() if lk.startswith(lower) or lower.startswith(lk)]
         if len(candidates) == 1:
             return candidates[0]

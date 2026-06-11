@@ -129,3 +129,38 @@ def test_registry_get_provider_unknown_raises():
 
     with pytest.raises(ValueError, match="Unknown provider"):
         get_provider(settings)
+
+
+def test_to_anthropic_merges_consecutive_user_turns():
+    """Aborted turn + resend leaves two user messages in a row; Anthropic requires alternating
+    roles, so the converter must coalesce them into one user turn."""
+    from llm.azure_anthropic import _to_anthropic_messages
+    out = _to_anthropic_messages([
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ])
+    assert len(out) == 1 and out[0]["role"] == "user"
+    assert out[0]["content"] == [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]
+
+
+def test_to_anthropic_merges_tool_results_then_user():
+    """Abort after tool calls: trailing tool_results (user turn) + a re-sent user message must
+    merge, keeping tool_result blocks valid alongside the new text."""
+    from llm.azure_anthropic import _to_anthropic_messages
+    out = _to_anthropic_messages([
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "r"},
+        {"role": "user", "content": "retry"},
+    ])
+    assert out[-1]["role"] == "user"
+    kinds = {b.get("type") for b in out[-1]["content"]}
+    assert "tool_result" in kinds and "text" in kinds
+
+
+def test_to_anthropic_leaves_alternating_untouched():
+    from llm.azure_anthropic import _to_anthropic_messages
+    out = _to_anthropic_messages([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+    ])
+    assert [m["role"] for m in out] == ["user", "assistant"]

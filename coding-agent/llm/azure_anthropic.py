@@ -1,4 +1,5 @@
 import json
+import httpx
 from anthropic import AsyncAnthropicFoundry
 from .base import LLMProvider, LLMResponse, ToolCall, Usage
 from config.settings import Settings
@@ -90,7 +91,19 @@ def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
         else:
             i += 1
 
-    return out
+    # Coalesce consecutive user turns into one (Anthropic requires alternating roles). This
+    # occurs when a turn is aborted mid-flight — e.g. a transient API error leaves an unanswered
+    # user message and the user re-sends — which would otherwise produce two user turns in a row
+    # and 400. Merge their content (normalizing str → a text block) so retries just work.
+    merged: list[dict] = []
+    for m in out:
+        if merged and merged[-1]["role"] == "user" and m["role"] == "user":
+            def _blocks(c):
+                return list(c) if isinstance(c, list) else [{"type": "text", "text": c}]
+            merged[-1]["content"] = _blocks(merged[-1]["content"]) + _blocks(m["content"])
+        else:
+            merged.append(dict(m))
+    return merged
 
 
 class AzureAnthropicProvider(LLMProvider):
@@ -98,6 +111,15 @@ class AzureAnthropicProvider(LLMProvider):
         self._client = AsyncAnthropicFoundry(
             api_key=settings.azure_anthropic_api_key,
             base_url=settings.azure_anthropic_endpoint,
+            # SDK default connect timeout is 5s — too tight for a VPN'd corporate Foundry
+            # endpoint, where a brief connect stall surfaced as APITimeoutError and killed the
+            # session. Generous connect; the read timeout is PER-CHUNK while streaming, so 120s
+            # is plenty for first-token latency yet fails a true stall in ~2 min instead of
+            # hanging ~10 min. Keep retries at 2 (the SDK default): each retry can wait up to the
+            # full read timeout, so more retries MULTIPLY worst-case latency on a stalling
+            # endpoint (a 4-retry stall ≈ 8 min). 2 bounds it while still absorbing brief blips.
+            timeout=httpx.Timeout(120.0, connect=30.0),
+            max_retries=2,
         )
         self._model = settings.azure_anthropic_deployment
 
@@ -150,7 +172,14 @@ class AzureAnthropicProvider(LLMProvider):
             if cache_idx >= 0:
                 _apply_cache_control(anthropic_messages[cache_idx])
 
-        response = await self._client.messages.create(**kwargs)
+        # Stream the response. A non-streaming messages.create() holds one socket open for the
+        # whole generation and can STALL silently on a flaky/VPN'd endpoint — the request just
+        # hangs until the read timeout (~10 min) with no output. Streaming keeps the connection
+        # active with incremental events (resetting the read clock per chunk) and is Anthropic's
+        # recommended path for reliable / long requests. get_final_message() reassembles the same
+        # Message object, so the parsing below is unchanged.
+        async with self._client.messages.stream(**kwargs) as stream:
+            response = await stream.get_final_message()
 
         text_parts = []
         tool_calls: list[ToolCall] = []

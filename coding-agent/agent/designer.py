@@ -29,20 +29,38 @@ call create_flow — you only design.
    ones with `legacy: true` — avoid them. A legacy "mega-component" that hides multiple
    stages (e.g. a single Natural-Language-to-SQL node) must be DECOMPOSED into explicit
    modern primitives.
-2. Consolidate static text (metadata, instructions, examples) into ONE Prompt component
-   using `{variable}` placeholders in its `template`. NEVER chain CombineText or multiple
-   text-input nodes. Langflow creates one input handle per `{var}` in the template — so set
-   the template first, then wire edges into those var fields.
+2. Consolidate static text (metadata, instructions, examples) for ONE logical prompt into a
+   single Prompt component using `{variable}` placeholders in its `template`. NEVER chain
+   CombineText or multiple text-input nodes. Langflow creates one input handle per `{var}` in
+   the template — so set the template first, then wire edges into those var fields.
+   IMPORTANT for multi-prompt pipelines: when the pipeline has SEVERAL distinct prompt stages
+   (e.g. an intent-classification prompt AND a SQL-generation prompt), emit a SEPARATE Prompt
+   node for each, and give EACH node its OWN `template` carrying ONLY that prompt's `{vars}`.
+   Do NOT reuse one template across prompt nodes and do NOT merge several prompts' text or vars
+   into a single template — each Prompt node's template and vars are independent.
 3. Match the described data flow as DISTINCT stages. If the user says one component emits
    text and a separate one consumes/executes it (e.g. "LLM returns SQL, then run that SQL"),
    wire them as separate nodes. Never collapse into one self-contained *Agent.
 4. Every REQUIRED input of every node must have a source edge.
+5. TYPE-CHECK every edge BEFORE you submit. For each edge confirm from `get_component_schema`
+   that (a) the target FIELD exists on the target component, and (b) the source output's type
+   is listed in that field's `input_types`. If your chosen component has no field that fits the
+   incoming data, or its output type does not fit the next stage's input, it is the WRONG
+   component — pick one whose schema actually fits the stage's role (use `list_components`).
+   A node that ends a pipeline (e.g. ChatOutput) must be reachable from ChatInput through the
+   stages — never leave a stage with its output going nowhere or its real input port empty.
 
 ## Common type strings (use these directly — do NOT call list_components for them)
 ChatInput, ChatOutput, AzureOpenAIModel (Azure LLM), Prompt (Prompt Template, the {var}
-component), SQLComponent (SQL Database — executes a query against a connection string),
-Parser. `get_component_schema` accepts display names too (e.g. "SQL Database"), so you do
-not need exact casing.
+component), Parser.
+
+To EXECUTE SQL use **`SQLComponent`** — inputs `query` (the generated SQL string) and
+`database_url` (connection string), output `run_sql_query` (Table, which ChatOutput accepts).
+WARNING: a different component, `SQLDatabase`, shares the display name "SQL Database" but only
+wraps a connection (single input `uri`, output a `SQLDatabase` object) and CANNOT run a query —
+never use it as the executor, and prefer the exact type string `SQLComponent` over the display
+name to avoid the collision. For a NL→SQL pipeline: Prompt → LLM (produces SQL) →
+`SQLComponent.query` (with `database_url` set) → ChatOutput.
 
 ## How to work — be efficient, you have a limited iteration budget
 1. In ONE turn, batch `get_component_schema` for every component type you intend to use.
@@ -55,8 +73,11 @@ not need exact casing.
 
 ## Node format
 {"id": "<Type>-1", "type": "<Type>", "position": {"x": <int>, "y": <int>}}
-Provide only id/type/position — schemas + credentials are injected later. For a Prompt node,
-also pass its `template` string in the node (so its `{var}` handles exist before wiring).
+Provide only id/type/position — schemas + credentials are injected later. EACH Prompt node MUST
+also carry its OWN `template` string in the node object, e.g.
+{"id": "Prompt-intent", "type": "Prompt", "position": {...}, "template": "Classify intent: {user_query}"}
+That per-node template defines exactly that node's `{var}` input handles before wiring — so two
+different prompt stages get two different node templates (never one shared template).
 
 ## Edge format
 {"source":"<src_id>",
@@ -67,9 +88,11 @@ also pass its `template` string in the node (so its `{var}` handles exist before
 ## Finishing
 Call `submit_design(summary, nodes, edges, prompt_template, vars)`:
 - summary: 1-2 sentences describing the pipeline stages.
-- nodes / edges: the full create_flow-ready arrays above.
-- prompt_template: the Prompt component's template string (or "" if none).
-- vars: the list of `{var}` names declared in that template (or []).
+- nodes / edges: the full create_flow-ready arrays above. Each Prompt node carries its OWN
+  `template` (this is how multi-prompt pipelines stay distinct).
+- prompt_template / vars: LEGACY single-prompt fallback only — set them ONLY when the whole
+  flow has exactly one Prompt node and you did not put a `template` on it. With per-node
+  templates (the normal case), leave prompt_template="" and vars=[].
 """
 
 _GET_SCHEMA = {
@@ -139,6 +162,13 @@ DESIGN_FLOW_TOOL_SCHEMA = {
             "properties": {
                 "request": {"type": "string", "description": "The full build request / described pipeline"},
                 "feedback": {"type": "string", "description": "Optional: revision notes if redesigning after a rejection"},
+                "resolved_stages": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional: the user-aligned stage→component map returned by "
+                                   "propose_pipeline (status 'ok' stages). Pass it so the designer "
+                                   "honors the agreed components instead of re-picking.",
+                },
             },
             "required": ["request"],
         },
@@ -164,7 +194,14 @@ def render_design(spec: dict) -> str:
             out = sh.get("name", "out") if isinstance(sh, dict) else "out"
             fld = th.get("fieldName", "?") if isinstance(th, dict) else "?"
             lines.append(f"- `{src}`.{out} → `{tgt}`.{fld}")
-    if spec.get("prompt_template"):
+    # Per-node templates (the normal multi-prompt case) — show each distinctly so the user can
+    # confirm the prompts are NOT identical.
+    node_templates = [(n.get("id", "?"), n.get("template")) for n in nodes if isinstance(n, dict) and n.get("template")]
+    if node_templates:
+        lines.append("\n**Prompt templates (per node):**")
+        for nid, tmpl in node_templates:
+            lines.append(f"- `{nid}`: `{tmpl}`")
+    elif spec.get("prompt_template"):
         lines.append(f"\n**Prompt template:** `{spec['prompt_template']}`")
         if spec.get("vars"):
             lines.append("**Prompt vars:** " + ", ".join(f"`{{{v}}}`" for v in spec["vars"]))
@@ -213,12 +250,28 @@ async def _list_components_compact(mcp) -> str:
     return json.dumps(out)
 
 
-async def design_flow(request: str, mcp, llm, feedback: str | None = None) -> dict:
+async def design_flow(request: str, mcp, llm, feedback: str | None = None,
+                      resolved_stages: list | None = None) -> dict:
     """Run the designer sub-agent. Returns the compact spec dict from submit_design, or
     {"error": ...} if it does not converge. ``feedback`` (from a rejected design) is folded
     into the opening message so the sub-agent revises rather than restarts blindly.
+    ``resolved_stages`` (from an approved propose_pipeline alignment) pins each stage's chosen
+    component/source so the designer materializes the agreed graph instead of re-guessing.
     """
     opening = f"Build request:\n{request}"
+    if resolved_stages:
+        opening += (
+            "\n\nThe user already aligned on this stage→component map — honor it ONE-TO-ONE: each "
+            "stage becomes exactly ONE node. Do NOT expand a stage into several nodes (e.g. do "
+            "not turn a single 'Gateway' stage into a Prompt + an LLM) and do not collapse "
+            "stages. Keep the stages DISTINCT and do not swap a valid choice. Verify every named "
+            "`component` exists via get_component_schema; if a name is not a real catalog type "
+            "(e.g. 'SQLExecutorComponent', or a user's custom 'LLM Gateway'), resolve it to the "
+            "correct existing type for that role, or use a single `CustomComponent` placeholder "
+            "for a genuinely custom node — never a multi-node substitute. TYPE-CHECK its I/O. "
+            "Then fill wiring, schemas, and per-node Prompt templates:\n"
+            + json.dumps(resolved_stages, indent=2)
+        )
     if feedback:
         opening += f"\n\nThe previous design was rejected. Revise per this feedback:\n{feedback}"
     messages: list[dict] = [{"role": "user", "content": opening}]
