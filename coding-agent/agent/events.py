@@ -7,6 +7,7 @@ of that it emits three *structured* signals through an EventSink:
 
   - tool_call(name, arguments) — a tool is about to run
   - flow_built(flow_id)        — a flow was created/updated/built (drives the canvas)
+  - usage(metrics)             — end-of-turn token/timing totals (drives the token meter)
   - final(text)                — the assistant's end-of-turn answer
 
 ConsoleSink is a no-op: the CLI already renders everything via console.print, so the
@@ -190,9 +191,11 @@ def slim_graph(flow: dict) -> dict | None:
 
 class EventSink(Protocol):
     flow_id: str | None
+    interactive: bool  # True = a human can answer console confirm gates (CLI); False = web/headless
     def tool_call(self, name: str, arguments: dict) -> None: ...
     def flow_built(self, flow_id: str | None, graph: dict | None = None) -> None: ...
     def flow_modified(self, graph: dict | None = None) -> None: ...
+    def usage(self, metrics: dict) -> None: ...
     def final(self, text: str | None) -> None: ...
 
 
@@ -200,6 +203,7 @@ class ConsoleSink:
     """No-op sink for the terminal REPL — existing console.print output is unchanged."""
 
     flow_id: str | None = None  # no canvas in the terminal; keeps run_turn's sink.flow_id checks falsy
+    interactive: bool = True  # terminal REPL: confirm gates can read y/n from stdin
 
     def tool_call(self, name: str, arguments: dict) -> None:
         pass
@@ -209,6 +213,9 @@ class ConsoleSink:
 
     def flow_modified(self, graph: dict | None = None) -> None:
         pass
+
+    def usage(self, metrics: dict) -> None:
+        pass  # CLI already prints the token/timing line via console.print
 
     def final(self, text: str | None) -> None:
         pass

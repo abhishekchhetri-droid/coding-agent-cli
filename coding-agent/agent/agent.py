@@ -410,6 +410,42 @@ def _assistant_tool_call_message(tool_calls: list[dict]) -> dict:
     }
 
 
+def _repair_tool_results(messages: list[dict]) -> list[dict]:
+    """Guarantee every assistant tool_call has a following tool result (in place).
+
+    Anthropic (and the OpenAI schema) reject a request where a ``tool_use``/``tool_calls``
+    id has no matching ``tool_result`` in the next message. A turn that is interrupted
+    mid-dispatch — a tool handler raising, an LLM error breaking the loop, or the old
+    EOF-on-confirm crash — leaves the assistant tool_call message appended but one or more
+    results missing. The web server persists this same list in place, so the gap poisons
+    EVERY later turn with a 400. Running this before each llm.complete inserts a synthetic
+    error result for any unmatched id, healing already-corrupted threads and any future gap.
+    Cheap no-op on healthy history. General: keyed only on tool_call ids, no tool names.
+    """
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+            j = i + 1
+            seen: set = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                seen.add(messages[j].get("tool_call_id"))
+                j += 1
+            missing = [tid for tid in ids if tid not in seen]
+            if missing:
+                inserts = [
+                    _tool_result_message(tid, "ERROR: tool result missing — previous turn was interrupted")
+                    for tid in missing
+                ]
+                messages[j:j] = inserts  # keep them in the consecutive tool block after the call
+                j += len(inserts)
+            i = j
+        else:
+            i += 1
+    return messages
+
+
 def _is_langmodel_node(n: dict) -> bool:
     return any(
         "LanguageModel" in (o.get("types") or o.get("output_types") or [])
@@ -454,6 +490,10 @@ async def run_turn(
     completion_tokens = 0
     turn_start = time.perf_counter()
     tool_time = 0.0  # cumulative wall-clock spent executing tools this turn (pure Python)
+    # Whether confirm gates may read y/n from stdin. The web/headless sink has no terminal,
+    # so its gates auto-approve (the user already drove the build via chat) instead of
+    # calling console.input — which would raise EOFError and crash the run.
+    _interactive = getattr(sink, "interactive", True)
     # Persistent agent state. Owned by run_chat (CLI) so it survives across turns; the
     # web path (server/app.py) passes nothing and gets fresh state per turn.
     #   todos/scratchpad        — plan + saved determinants, rendered each iteration
@@ -487,6 +527,10 @@ async def run_turn(
     _schema_msg_ids: set[str] = set()
 
     while iterations < settings.max_tool_iterations:
+        # Heal any dangling tool_call from a previously interrupted turn before the LLM sees
+        # the history — otherwise Anthropic 400s on the unmatched tool_use id (and the web
+        # server, which persists this list, would 400 on every turn forever).
+        _repair_tool_results(messages)
         # planning tools are agent-side (loop state closures), appended to the MCP set.
         # Order: [stable baseline+virtual] + [stable planning] + [volatile discovered].
         # Planning tools are stable, so they belong in the cached region ahead of the
@@ -1057,8 +1101,16 @@ async def run_turn(
                 elif build_block:
                     result = build_block
                 elif tc["name"] == "get_component_schema":
-                    result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
-                    _schema_msg_ids.add(tc["id"])
+                    # Direct (sync) Langflow fetch — a 403/timeout/5xx here must become a tool
+                    # result, not an uncaught raise that kills the turn (and the web run).
+                    try:
+                        result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
+                        _schema_msg_ids.add(tc["id"])
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        raise
+                    except Exception as e:
+                        console.print(f"[red]✗ get_component_schema failed:[/red] {type(e).__name__}: {e}")
+                        result = json.dumps({"error": f"{type(e).__name__}: {e}. Retry, or proceed without this schema."})
                 elif tc["name"] == "clone_starter_template":
                     # Server-side clone: fetch template → enrich → POST directly, zero LLM token cost
                     name_or_id = (args.get("name_or_id") or "").strip()
@@ -1231,7 +1283,9 @@ async def run_turn(
                             Markdown(designer.render_design(spec)),
                             title="[bold]Proposed Design[/bold]", border_style="cyan",
                         ))
-                        approve = _plan_confirmed
+                        # Headless (web): no stdin to read a y/n, so auto-approve — the user
+                        # already requested the build through chat.
+                        approve = _plan_confirmed or not _interactive
                         if not approve:
                             try:
                                 answer = console.input(
@@ -1280,7 +1334,8 @@ async def run_turn(
                         # Confirm-gate ONCE per request, only for a real multi-step
                         # plan. After approval the agent auto-locks and won't re-prompt.
                         needs_gate = (
-                            not _plan_confirmed
+                            _interactive
+                            and not _plan_confirmed
                             and len(todos) >= 2
                             and any(t["status"] != "completed" for t in todos)
                         )
@@ -1569,6 +1624,16 @@ async def run_turn(
                     f"{max(total_elapsed - tool_time, 0):.1f}s) · ↑{prompt_tokens:,} "
                     f"↓{completion_tokens:,} tokens[/dim]"
                 )
+                # Same numbers the CLI prints, pushed to the web token meter. No-op on the
+                # CLI's ConsoleSink, so terminal output is unchanged.
+                sink.usage({
+                    "prompt": prompt_tokens,
+                    "completion": completion_tokens,
+                    "total": prompt_tokens + completion_tokens,
+                    "elapsed_s": round(total_elapsed, 1),
+                    "tool_s": round(tool_time, 1),
+                    "llm_s": round(max(total_elapsed - tool_time, 0), 1),
+                })
             # Compact fat flow snapshots (verification get_flow ~5K) before they carry
             # into the next turn, then apply summarization.
             compact_flow_snapshots(messages)

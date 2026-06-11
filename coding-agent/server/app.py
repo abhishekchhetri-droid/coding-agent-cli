@@ -47,42 +47,58 @@ from server.canvas import apply_canvas_ops
 
 logger = logging.getLogger("agent.server")
 
-# Per-thread conversation history (internal OpenAI-style message dicts) and last flow.
+# Per-thread conversation history (internal OpenAI-style message dicts), last flow,
+# and cumulative session token total (sum of every turn's tokens on the thread).
 _THREADS: dict[str, list[dict]] = {}
 _THREAD_FLOW: dict[str, str] = {}
+_THREAD_TOKENS: dict[str, int] = {}
 
 
 class AGUISink:
     """Translates agent run_turn signals into AG-UI events on an asyncio.Queue."""
 
-    def __init__(self, queue: "asyncio.Queue", langflow_base_url: str):
+    interactive = False  # no stdin in the web server — confirm gates must auto-approve
+
+    def __init__(self, queue: "asyncio.Queue", langflow_base_url: str, session_tokens: int = 0):
         self._q = queue
         self._base = langflow_base_url.rstrip("/")
         self.flow_id: str | None = None
         self.graph: dict | None = None  # last known graph, so graph-less snapshots don't blank the canvas
+        self.usage_metrics: dict | None = None  # last turn's token/timing totals
+        self.session_tokens = session_tokens  # cumulative tokens across this thread's turns
 
     def tool_call(self, name: str, arguments: dict) -> None:
         self._q.put_nowait(StepStartedEvent(type=EventType.STEP_STARTED, step_name=name))
         self._q.put_nowait(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=name))
 
-    def _snapshot(self, flow_id: str, graph: dict | None) -> dict:
-        # STATE_SNAPSHOT replaces the whole client state, so always include the last
-        # known graph — a graph-less signal (e.g. build_flow) must not erase the canvas.
-        if graph is not None:
-            self.graph = graph
-        snap = {"flow_id": flow_id, "flow_url": f"{self._base}/flow/{flow_id}"}
-        if self.graph is not None:
-            snap["graph"] = self.graph
+    def _full_state(self) -> dict:
+        # STATE_SNAPSHOT replaces the WHOLE client state, so every snapshot must carry all
+        # known fields — flow + last graph + usage — or an event that knows only one of them
+        # (e.g. a usage tick on a pure-chat turn, or a graph-less build_flow) would erase the
+        # rest. Each field is included only once it has a value.
+        snap: dict = {}
+        if self.flow_id:
+            snap["flow_id"] = self.flow_id
+            snap["flow_url"] = f"{self._base}/flow/{self.flow_id}"
+            if self.graph is not None:
+                snap["graph"] = self.graph
+        if self.usage_metrics is not None:
+            snap["usage"] = self.usage_metrics
         return snap
+
+    def _emit_state(self) -> None:
+        self._q.put_nowait(StateSnapshotEvent(
+            type=EventType.STATE_SNAPSHOT,
+            snapshot=self._full_state(),
+        ))
 
     def flow_built(self, flow_id: str | None, graph: dict | None = None) -> None:
         if not flow_id:
             return
         self.flow_id = flow_id
-        self._q.put_nowait(StateSnapshotEvent(
-            type=EventType.STATE_SNAPSHOT,
-            snapshot=self._snapshot(flow_id, graph),
-        ))
+        if graph is not None:
+            self.graph = graph
+        self._emit_state()
 
     def flow_modified(self, graph: dict | None = None) -> None:
         """Re-emit STATE_SNAPSHOT with the latest graph after in-place modifications.
@@ -92,10 +108,15 @@ class AGUISink:
         """
         if not self.flow_id:
             return
-        self._q.put_nowait(StateSnapshotEvent(
-            type=EventType.STATE_SNAPSHOT,
-            snapshot=self._snapshot(self.flow_id, graph),
-        ))
+        if graph is not None:
+            self.graph = graph
+        self._emit_state()
+
+    def usage(self, metrics: dict) -> None:
+        """End-of-turn token/timing totals → token meter. Tracks a running session total."""
+        self.session_tokens += int(metrics.get("total", 0) or 0)
+        self.usage_metrics = {**metrics, "session_total": self.session_tokens}
+        self._emit_state()
 
     def final(self, text: str | None) -> None:
         if not text:
@@ -184,7 +205,7 @@ async def agent_endpoint(request: Request):
 
     encoder = EventEncoder()
     queue: "asyncio.Queue" = asyncio.Queue()
-    sink = AGUISink(queue, settings.langflow_base_url)
+    sink = AGUISink(queue, settings.langflow_base_url, session_tokens=_THREAD_TOKENS.get(thread_id, 0))
     # Seed the flow id from the thread so edits to an EXISTING flow (e.g. "remove the
     # url tool") emit canvas snapshots. Without this, a turn that never calls create_flow
     # leaves sink.flow_id=None and flow_modified() is suppressed.
@@ -197,6 +218,7 @@ async def agent_endpoint(request: Request):
             _THREADS[thread_id] = updated
             if sink.flow_id:
                 _THREAD_FLOW[thread_id] = sink.flow_id
+            _THREAD_TOKENS[thread_id] = sink.session_tokens
         except Exception as e:  # surface as RUN_ERROR
             logger.exception("run_turn failed")
             queue.put_nowait(("__error__", str(e)))
@@ -207,24 +229,27 @@ async def agent_endpoint(request: Request):
         yield encoder.encode(RunStartedEvent(
             type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id,
         ))
-        # Replay the thread's current flow so a reconnecting client repaints its canvas.
-        # Fetch the graph too — a reloaded browser has no prior state to diff against.
+        # Replay the thread's current flow + session token total so a reconnecting client
+        # repaints its canvas and meter. Fetch the graph too — a reloaded browser has no
+        # prior state to diff against. Routed through the sink so the replayed snapshot
+        # carries every known field (flow + graph + usage) and nothing gets erased.
         prior_flow = _THREAD_FLOW.get(thread_id)
         if prior_flow:
-            base = settings.langflow_base_url.rstrip("/")
-            snapshot = {"flow_id": prior_flow, "flow_url": f"{base}/flow/{prior_flow}"}
             try:
                 raw = await mcp.call_tool("get_flow", {"flow_id": prior_flow})
                 flow = json.loads(raw) if isinstance(raw, str) else raw
                 graph = slim_graph(flow) if isinstance(flow, dict) else None
                 if graph is not None:
-                    snapshot["graph"] = graph
                     sink.graph = graph  # seed so a graph-less build_flow this turn won't blank it
             except Exception:
                 logger.warning("replay get_flow failed for %s", prior_flow, exc_info=True)
+        if sink.session_tokens:
+            # Show the carried-over session total immediately (no per-field turn detail yet).
+            sink.usage_metrics = {"session_total": sink.session_tokens}
+        if prior_flow or sink.session_tokens:
             yield encoder.encode(StateSnapshotEvent(
                 type=EventType.STATE_SNAPSHOT,
-                snapshot=snapshot,
+                snapshot=sink._full_state(),
             ))
 
         task = asyncio.create_task(runner())

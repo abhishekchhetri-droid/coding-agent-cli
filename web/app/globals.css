@@ -16,3 +16,18 @@ body > div {
 .nokia-chat > div {
   height: 100%;
 }
+
+@keyframes nokiaPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5);
+    opacity: 1;
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(52, 211, 153, 0);
+    opacity: 0.85;
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
+    opacity: 1;
+  }
+}

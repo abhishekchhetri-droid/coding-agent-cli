@@ -44,10 +44,23 @@ type GraphEdge = {
 };
 type FlowGraph = { nodes: GraphNode[]; edges: GraphEdge[] };
 
+// Per-turn token/timing totals streamed from the server's STATE_SNAPSHOT (mirrors the
+// CLI's end-of-turn "total:" line). session_total accumulates across the thread's turns.
+type Usage = {
+  prompt?: number;
+  completion?: number;
+  total?: number;
+  elapsed_s?: number;
+  tool_s?: number;
+  llm_s?: number;
+  session_total?: number;
+};
+
 type FlowState = {
   flow_id?: string;
   flow_url?: string;
   graph?: FlowGraph;
+  usage?: Usage;
 };
 
 // One canvas-edit op sent to /api/canvas (persisted to Langflow, bypassing the LLM).
@@ -535,6 +548,79 @@ function FlowCanvas({ threadId }: { threadId: string }) {
   );
 }
 
+const fmtTokens = (n?: number): string =>
+  n == null ? "—" : n.toLocaleString("en-US");
+
+// One labelled token metric: a colored glyph, the number (tabular mono), a muted unit.
+function Metric({
+  glyph,
+  value,
+  unit,
+  color,
+  strong,
+}: {
+  glyph: string;
+  value?: number;
+  unit: string;
+  color: string;
+  strong?: boolean;
+}) {
+  return (
+    <span style={styles.metric} title={`${unit}: ${fmtTokens(value)} tokens`}>
+      <span style={{ color, fontWeight: 700 }}>{glyph}</span>
+      <span style={{ ...styles.metricNum, color: strong ? "#f1f3f8" : "#cdd1db", fontWeight: strong ? 700 : 500 }}>
+        {fmtTokens(value)}
+      </span>
+      <span style={styles.metricUnit}>{unit}</span>
+    </span>
+  );
+}
+
+// Slim meter docked under the chat: last turn's input/output/total tokens + time, with a
+// running session total on the right. Reads the same coagent state the canvas does.
+function TokenBar() {
+  const { state, running } = useCoAgent<FlowState>({ name: "langflow", initialState: {} });
+  const u = state.usage;
+  const hasTurn = Boolean(u && u.total != null);
+
+  return (
+    <div style={styles.tokenBar}>
+      {hasTurn ? (
+        <>
+          <div style={styles.tokenLeft}>
+            <Metric glyph="↑" value={u?.prompt} unit="in" color="#34d399" />
+            <span style={styles.dot}>·</span>
+            <Metric glyph="↓" value={u?.completion} unit="out" color="#38bdf8" />
+            <span style={styles.dot}>·</span>
+            <Metric glyph="∑" value={u?.total} unit="total" color="#e5e7eb" strong />
+          </div>
+          <div style={styles.tokenRight}>
+            {running && <span style={styles.pulse} aria-hidden />}
+            {u?.elapsed_s != null && (
+              <span style={styles.time} title={`tools ${u.tool_s ?? 0}s · llm ${u.llm_s ?? 0}s`}>
+                ◷ {u.elapsed_s}s
+              </span>
+            )}
+            <span style={styles.session} title="cumulative tokens this session">
+              session <strong style={{ color: "#aeb3c0", fontWeight: 600 }}>{fmtTokens(u?.session_total)}</strong>
+            </span>
+          </div>
+        </>
+      ) : (
+        <span style={styles.tokenIdle}>
+          {running ? (
+            <>
+              <span style={styles.pulse} aria-hidden /> measuring…
+            </>
+          ) : (
+            "Token usage appears here after your first turn"
+          )}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export default function Home() {
   const [threadId, setThreadId] = useState("");
   useEffect(() => { setThreadId(getOrCreateThreadId()); }, []);
@@ -543,13 +629,16 @@ export default function Home() {
     <CopilotKit runtimeUrl="/api/copilotkit" agent="langflow" threadId={threadId || undefined}>
       <main style={styles.main}>
         <section style={styles.chatPane}>
-          <CopilotChat
-            labels={{
-              title: "Flow Builder",
-              initial: "Hi! Tell me what flow to build and watch it render on the right.",
-            }}
-            className="nokia-chat"
-          />
+          <div style={styles.chatScroll}>
+            <CopilotChat
+              labels={{
+                title: "Flow Builder",
+                initial: "Hi! Tell me what flow to build and watch it render on the right.",
+              }}
+              className="nokia-chat"
+            />
+          </div>
+          <TokenBar />
         </section>
         <section style={styles.canvasPane}>
           <FlowCanvas threadId={threadId} />
@@ -567,6 +656,49 @@ const styles: Record<string, React.CSSProperties> = {
     borderRight: "1px solid #e5e5e5",
     height: "100%",
     overflow: "hidden",
+    display: "flex",
+    flexDirection: "column",
+  },
+  chatScroll: { flex: 1, minHeight: 0, overflow: "hidden" },
+  tokenBar: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    height: 34,
+    flexShrink: 0,
+    padding: "0 14px",
+    borderTop: "1px solid #20232c",
+    background: "#15171d",
+    color: "#cdd1db",
+    fontSize: 12,
+    fontVariantNumeric: "tabular-nums",
+    userSelect: "none",
+  },
+  tokenLeft: { display: "flex", alignItems: "center", gap: 8 },
+  tokenRight: { display: "flex", alignItems: "center", gap: 12 },
+  metric: { display: "inline-flex", alignItems: "baseline", gap: 4 },
+  metricNum: {
+    fontFamily: "'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace",
+    fontSize: 12.5,
+    letterSpacing: 0.2,
+  },
+  metricUnit: { fontSize: 10.5, color: "#6b7080", textTransform: "uppercase", letterSpacing: 0.5 },
+  dot: { color: "#3a3e4a" },
+  time: {
+    fontFamily: "'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace",
+    fontSize: 11.5,
+    color: "#8b8f9c",
+  },
+  session: { fontSize: 11.5, color: "#7a7f8c" },
+  tokenIdle: { fontSize: 11.5, color: "#6b7080", display: "inline-flex", alignItems: "center", gap: 7 },
+  pulse: {
+    width: 7,
+    height: 7,
+    borderRadius: "50%",
+    background: "#34d399",
+    boxShadow: "0 0 0 0 rgba(52,211,153,0.55)",
+    animation: "nokiaPulse 1.4s ease-out infinite",
   },
   canvasPane: { flex: 1, height: "100%", background: "#0f0f14" },
   canvasWrap: { display: "flex", flexDirection: "column", height: "100%" },
