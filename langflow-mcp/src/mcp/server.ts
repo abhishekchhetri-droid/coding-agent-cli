@@ -10,6 +10,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { ZodError } from 'zod';
 import { langflowMCPTools } from './tools';
+import { compositeTools, compositeToolNames, handleCompositeTool } from './composite-tools';
 import { logger } from '../utils/logger';
 import { LangflowClient } from '../services/langflow-client';
 import { LangflowConfig } from '../types';
@@ -417,9 +418,11 @@ export class LangflowMCPServer {
       const deprecatedTools = ['build_vertices', 'get_vertex', 'stream_vertex_build', 'get_task_status'];
       const enableDeprecated = process.env.ENABLE_DEPRECATED_TOOLS !== 'false';
 
-      const toolsToShow = enableDeprecated
+      const baseTools = enableDeprecated
         ? langflowMCPTools
         : langflowMCPTools.filter(tool => !deprecatedTools.includes(tool.name));
+      // Composite/convenience tools (ported from the Python mcpbridge virtual tools).
+      const toolsToShow = [...baseTools, ...compositeTools];
 
       return {
         tools: toolsToShow.map(tool => ({
@@ -1654,6 +1657,11 @@ export class LangflowMCPServer {
           }
 
           default:
+            // Composite/convenience tools (ported from the Python mcpbridge virtual tools).
+            if (compositeToolNames.has(name)) {
+              const result = await handleCompositeTool(name, args, this.client);
+              return this.formatSuccessResponse(result);
+            }
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {

@@ -56,6 +56,31 @@ async def test_search_tools_ranks_name_match_above_description_and_activates():
 
 
 @pytest.mark.asyncio
+async def test_search_tools_skips_virtual_tool_names_to_avoid_duplicates():
+    """Now that langflow-mcp also exposes the composite tools (delete_node, search_flows,
+    get_component_schema, clone/get_starter_template), they appear in _tools_cache. The agent
+    handles those itself via _VIRTUAL_TOOLS, so search_tools must NOT activate the server copies
+    — otherwise get_tool_schemas would emit a duplicate tool name and the LLM API rejects it."""
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._session = object()
+    client._discovered = []
+    client._tools_cache = [
+        _mk_tool("delete_node", "Remove nodes from a flow"),
+        _mk_tool("create_variable", "Create a global variable"),
+    ]
+    import json as _json
+    out = _json.loads(await client.call_tool("search_tools", {"query": "delete node variable"}))
+    names = [m["name"] for m in out["matches"]]
+    assert "delete_node" not in names  # virtual tool — handled agent-side, never discovered
+    assert "delete_node" not in client._discovered
+    assert "create_variable" in client._discovered  # normal long-tail tool still discoverable
+    schemas = client.get_tool_schemas()
+    schema_names = [s["function"]["name"] for s in schemas]
+    assert schema_names.count("delete_node") == 1  # exactly one (the virtual entry), no dup
+
+
+@pytest.mark.asyncio
 async def test_search_tools_empty_match_returns_hint():
     from mcpbridge.client import LangflowMCPClient
     client = LangflowMCPClient.__new__(LangflowMCPClient)
@@ -78,6 +103,61 @@ async def test_search_tools_fifo_cap_bounds_active_set():
     import json as _json
     await client.call_tool("search_tools", {"query": "knowledge", "limit": 25})
     assert len(client._discovered) <= LangflowMCPClient._DISCOVERY_CAP
+
+
+def _fake_mcp_result(text):
+    item = MagicMock()
+    item.text = text
+    res = MagicMock()
+    res.content = [item]
+    return res
+
+
+@pytest.mark.asyncio
+async def test_delete_node_routes_to_server_when_flag_set():
+    """USE_SERVER_COMPOSITE_TOOLS on → delete_node falls through to langflow-mcp (the TS
+    composite tool) instead of the in-process Python _handle_delete_node."""
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._use_server_composite = True
+    client._redis_cache = None
+    client._tools_cache = []
+    client._session = AsyncMock()
+    client._session.call_tool = AsyncMock(return_value=_fake_mcp_result('{"flow_id":"f1"}'))
+    client._handle_delete_node = AsyncMock(side_effect=AssertionError("Python path must not run"))
+
+    out = await client.call_tool("delete_node", {"flow_id": "f1", "node_ids": ["x"]})
+    client._session.call_tool.assert_awaited_once_with("delete_node", {"flow_id": "f1", "node_ids": ["x"]})
+    assert out == '{"flow_id":"f1"}'
+
+
+@pytest.mark.asyncio
+async def test_search_flows_routes_to_server_when_flag_set():
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._use_server_composite = True
+    client._redis_cache = None
+    client._tools_cache = []
+    client._session = AsyncMock()
+    client._session.call_tool = AsyncMock(return_value=_fake_mcp_result('[{"id":"1"}]'))
+
+    out = await client.call_tool("search_flows", {"query": "rahu"})
+    client._session.call_tool.assert_awaited_once_with("search_flows", {"query": "rahu"})
+    assert out == '[{"id":"1"}]'
+
+
+@pytest.mark.asyncio
+async def test_delete_node_uses_python_path_by_default():
+    """Flag off (default) → delete_node still handled in-process by Python (dual-path)."""
+    from mcpbridge.client import LangflowMCPClient
+    client = LangflowMCPClient.__new__(LangflowMCPClient)
+    client._use_server_composite = False
+    client._session = object()
+    client._handle_delete_node = AsyncMock(return_value='{"ok":1}')
+
+    out = await client.call_tool("delete_node", {"flow_id": "f1", "node_ids": ["x"]})
+    client._handle_delete_node.assert_awaited_once()
+    assert out == '{"ok":1}'
 
 
 @pytest.mark.asyncio

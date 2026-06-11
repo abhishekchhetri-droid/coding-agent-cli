@@ -210,6 +210,29 @@ export class LangflowClient {
     }
   }
 
+  /**
+   * Fetch the full component schemas from /api/v1/all, flattened from
+   * {category: {type: schema}} into {type: schema}. Unlike listComponents (which
+   * projects to lossy ComponentInfo), this preserves template/outputs/legacy so
+   * callers (e.g. the get_component_schema composite tool) get the raw schema.
+   */
+  async getComponentSchemas(): Promise<Record<string, any>> {
+    try {
+      const response = await this.client.get<any>('/all');
+      const flat: Record<string, any> = {};
+      if (response.data && typeof response.data === 'object') {
+        for (const items of Object.values<any>(response.data)) {
+          if (items && typeof items === 'object') {
+            Object.assign(flat, items);
+          }
+        }
+      }
+      return flat;
+    } catch (error) {
+      throw this.handleError(error, 'Failed to fetch component schemas');
+    }
+  }
+
   async runFlow(
     flowIdOrName: string,
     inputRequest: RunFlowRequest,

@@ -1076,7 +1076,13 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     elif build_block:
                         result = build_block
                     elif tc["name"] == "get_component_schema":
-                        result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
+                        # USE_SERVER_COMPOSITE_TOOLS routes this to langflow-mcp; default is the
+                        # in-process Python implementation (FlowEnrichmentMixin.get_component_schema).
+                        if getattr(mcp, "_use_server_composite", False):
+                            result = await mcp.call_tool("get_component_schema", {"type_name": args.get("type_name", "")})
+                            console.print("[dim]↳ get_component_schema via langflow-mcp[/dim]")
+                        else:
+                            result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
                         _schema_msg_ids.add(tc["id"])
                     elif tc["name"] == "clone_starter_template":
                         # Server-side clone: fetch template → enrich → POST directly, zero LLM token cost
@@ -1192,21 +1198,28 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             except Exception as clone_err:
                                 result = f"ERROR cloning template: {clone_err}"
                     elif tc["name"] == "get_starter_template":
-                        # Virtual tool — look up cached starter data, return full template for ONE winner
-                        key = (args.get("name_or_id") or "").strip().lower()
-                        match = _starter_cache.get(key)
-                        if not match:
-                            # Try partial name match
-                            for k, v in _starter_cache.items():
-                                if key in k or k in key:
-                                    match = v
-                                    break
-                        if match:
-                            result = json.dumps({"id": match.get("id"), "name": match.get("name"), "data": match.get("data", {})})
+                        # USE_SERVER_COMPOSITE_TOOLS routes this to langflow-mcp (which fetches
+                        # basic_examples directly); default is the agent-local _starter_cache.
+                        if getattr(mcp, "_use_server_composite", False):
+                            result = await mcp.call_tool("get_starter_template", {"name_or_id": args.get("name_or_id", "")})
                             _starter_template_msg_ids.add(tc["id"])
-                            console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
+                            console.print("[dim]↳ get_starter_template via langflow-mcp[/dim]")
                         else:
-                            result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call get_basic_examples first."})
+                            # Virtual tool — look up cached starter data, return full template for ONE winner
+                            key = (args.get("name_or_id") or "").strip().lower()
+                            match = _starter_cache.get(key)
+                            if not match:
+                                # Try partial name match
+                                for k, v in _starter_cache.items():
+                                    if key in k or k in key:
+                                        match = v
+                                        break
+                            if match:
+                                result = json.dumps({"id": match.get("id"), "name": match.get("name"), "data": match.get("data", {})})
+                                _starter_template_msg_ids.add(tc["id"])
+                                console.print(f"[dim]↳ starter template '{match.get('name')}' served from cache[/dim]")
+                            else:
+                                result = json.dumps({"error": f"Template '{args.get('name_or_id')}' not found in cache. Call get_basic_examples first."})
                     elif tc["name"] == "propose_pipeline":
                         # Real-life multi-stage build: render the stage→component map, capture it
                         # to scratchpad, and tell the model to ask the user about ambiguous stages
