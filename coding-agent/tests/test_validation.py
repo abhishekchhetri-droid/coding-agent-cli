@@ -61,6 +61,28 @@ CATALOG = {
         },
         "outputs": [{"name": "response", "types": ["Message"]}],
     },
+    "FileLoader": {
+        "display_name": "File", "template": {},
+        "outputs": [{"name": "data", "types": ["Data"]}],
+    },
+    # Required PURE-handle input (type "other"): genuinely must be wired.
+    "Summarizer": {
+        "display_name": "Summarizer",
+        "template": {"data": {"type": "other", "required": True, "input_types": ["Data"]}},
+        "outputs": [{"name": "summary", "types": ["Message"]}],
+    },
+    # Required CONFIG fields: value-capable str fields that also expose a Message handle
+    # (the azure_endpoint / azure_deployment / api_key shape). Filled in the UI or injected
+    # from settings — never a forced wire, never a feeder node.
+    "CloudLLM": {
+        "display_name": "Cloud LLM",
+        "template": {
+            "endpoint": {"type": "str", "required": True, "input_types": ["Message"]},
+            "api_key": {"type": "str", "required": True, "password": True, "input_types": ["Message"]},
+            "input_value": {"type": "str", "input_types": ["Message"]},
+        },
+        "outputs": [{"name": "text_output", "types": ["Message"]}],
+    },
     # Stateful vector store: BOTH a data-ingest input and a query input (the FAISS/Chroma/Qdrant
     # signature). Splitting ingest and search across two instances → separate indexes → broken.
     "VStore": {
@@ -69,6 +91,7 @@ CATALOG = {
             "ingest_data": {"type": "other", "input_types": ["Data", "DataFrame", "Table"]},
             "search_query": {"type": "query", "input_types": ["Message"]},
             "embedding": {"type": "other", "input_types": ["Embeddings"]},
+            "index_name": {"type": "str"},  # value-typed persistence key
         },
         "outputs": [{"name": "search_results", "types": ["Data"]}],
     },
@@ -199,18 +222,30 @@ def test_nonexistent_node_id_flagged():
     assert any("Ghost-1" in x and "unknown target" in x for x in v)
 
 
-def test_required_input_unwired_flagged():
-    """ChatOutput.input_value is required + handle-typed; with no incoming edge it's flagged
-    (generalizes the dead-end/severed post-build check to design time)."""
+def test_required_pure_handle_unwired_flagged():
+    """A required type-"other" input is a pure handle — it MUST be wired; with no incoming
+    edge it's flagged (generalizes the dead-end/severed post-build check to design time)."""
     c = _client()
-    v = c.validate_design([_node("CO-1", "ChatOutput")], [])
-    assert any("input_value" in x and "no incoming edge" in x for x in v)
+    v = c.validate_design([_node("S-1", "Summarizer")], [])
+    assert any("data" in x and "no incoming edge" in x for x in v)
 
 
 def test_required_input_satisfied_by_edge():
     c = _client()
-    nodes = [_node("CI-1", "ChatInput"), _node("CO-1", "ChatOutput")]
-    edges = [_edge("CI-1", "message", "CO-1", "input_value", ["Message"], ["Message"])]
+    nodes = [_node("F-1", "FileLoader"), _node("S-1", "Summarizer")]
+    edges = [_edge("F-1", "data", "S-1", "data", ["Data"], ["Data"])]
+    assert c.validate_design(nodes, edges) == []
+
+
+def test_required_config_fields_left_empty_pass():
+    """The TextInput-feeder regression: required value-capable config fields (endpoint,
+    api_key — str fields that also expose a Message handle) are NOT forced wires. They stay
+    empty at design time (user fills them in the UI / settings inject them), so an unwired
+    CloudLLM produces no violations — and the designer has no reason to invent feeder nodes.
+    Mirrors the post-build audit's pure-handle vs credential/literal distinction."""
+    c = _client()
+    nodes = [_node("CI-1", "ChatInput"), _node("LLM-1", "CloudLLM")]
+    edges = [_edge("CI-1", "message", "LLM-1", "input_value", ["Message"], ["Message"])]
     assert c.validate_design(nodes, edges) == []
 
 
@@ -220,6 +255,76 @@ def test_notenode_skipped():
              _node("CO-1", "ChatOutput")]
     edges = [_edge("CI-1", "message", "CO-1", "input_value", ["Message"], ["Message"])]
     assert c.validate_design(nodes, edges) == []
+
+
+# ---------------------------------------------------------------- duplicate stateful stores
+def _store_node(nid, index_name=None):
+    """A VStore node; when index_name is given, shaped like an enriched node carrying a
+    value-typed config (the persistence key)."""
+    n = _node(nid, "VStore")
+    if index_name is not None:
+        n["data"] = {"type": "VStore", "node": {"template": {
+            "index_name": {"type": "str", "value": index_name},
+        }}}
+    return n
+
+
+def test_duplicate_stateful_store_split_flagged():
+    """The over-decomposition bug: designer splits ingest and search across TWO instances of
+    the same store. Each keeps its own index, so ingested data is invisible to the search
+    node. One violation naming both ids, the merge fix, and the schema-discovered field roles."""
+    c = _client()
+    nodes = [
+        _node("CI-1", "ChatInput"),
+        _store_node("VS-ingest"), _store_node("VS-search"),
+        _node("F-1", "FileLoader"),
+    ]
+    edges = [
+        # ingest side wired into one instance, query side into the other
+        _edge("F-1", "data", "VS-ingest", "ingest_data", ["Data"], ["Data"]),
+        _edge("CI-1", "message", "VS-search", "search_query", ["Message"], ["Message"]),
+    ]
+    v = c.validate_design(nodes, edges)
+    dup = [x for x in v if "VS-ingest" in x and "VS-search" in x]
+    assert len(dup) == 1
+    assert "merge" in dup[0].lower()
+    # field roles are read from the schema, not hardcoded
+    assert "ingest_data" in dup[0] and "search_query" in dup[0]
+
+
+def test_single_store_wiring_both_passes():
+    """The always-valid fix: ONE store node carrying both ingest and query edges."""
+    c = _client()
+    nodes = [_node("CI-1", "ChatInput"), _store_node("VS-1"), _node("F-1", "FileLoader")]
+    edges = [
+        _edge("F-1", "data", "VS-1", "ingest_data", ["Data"], ["Data"]),
+        _edge("CI-1", "message", "VS-1", "search_query", ["Message"], ["Message"]),
+    ]
+    assert [x for x in c.validate_design(nodes, edges) if "VS-1" in x] == []
+
+
+def test_duplicate_stores_with_distinct_persistence_pass():
+    """Two instances pointing at DIFFERENT collections (distinct value-typed config) are a
+    legitimate multi-store flow — not flagged."""
+    c = _client()
+    nodes = [_store_node("VS-a", index_name="policies"), _store_node("VS-b", index_name="faqs")]
+    assert [x for x in c.validate_design(nodes, []) if "duplicate" in x.lower()] == []
+
+
+def test_duplicate_stateless_components_pass():
+    """Duplicating a stateless component (Parser) is normal — never flagged."""
+    c = _client()
+    nodes = [_node("PR-1", "Parser"), _node("PR-2", "Parser")]
+    assert [x for x in c.validate_design(nodes, []) if "duplicate" in x.lower()] == []
+
+
+def test_duplicate_agents_pass():
+    """Shape-predicate guard: Agent has a Message input + Message output + a Tool input, but is
+    NOT a stateful store — multi-agent flows must not be flagged."""
+    c = _client()
+    nodes = [_node("A-1", "Agent"), _node("A-2", "Agent")]
+    v = c.validate_design(nodes, [])
+    assert [x for x in v if "duplicate" in x.lower()] == []
 
 
 # ---------------------------------------------------------------- find_bridges

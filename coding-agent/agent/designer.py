@@ -44,7 +44,12 @@ call create_flow — you only design.
 3. Match the described data flow as DISTINCT stages. If the user says one component emits
    text and a separate one consumes/executes it (e.g. "LLM returns SQL, then run that SQL"),
    wire them as separate nodes. Never collapse into one self-contained *Agent.
-4. Every REQUIRED input of every node must have a source edge.
+4. Wire every REQUIRED pure-DATA input (schema field type `other` — Data/DataFrame/
+   Embeddings/Tool/...). Config and credential fields are NOT data inputs: endpoints,
+   deployment names, API keys, api versions, index/collection names — any `str` field, even
+   when required and even when it exposes a Message handle — must be LEFT EMPTY and UNWIRED.
+   They are injected from settings after design or filled by the user in the Langflow UI.
+   NEVER create passthrough feeder nodes (TextInput or similar) to fill a config field.
 5. TYPE-CHECK every edge BEFORE you submit. For each edge confirm from `get_component_schema`
    that (a) the target FIELD exists on the target component, and (b) the source output's type
    is listed in that field's `input_types`. If your chosen component has no field that fits the
@@ -54,6 +59,12 @@ call create_flow — you only design.
    stages — never leave a stage with its output going nowhere or its real input port empty.
    `submit_design` is machine-validated against the live schemas; a `design_invalid` result
    lists violations with catalog-discovered fixes — resolve all of them and resubmit.
+6. A STATEFUL STORE (any component whose schema has both a data-ingest input and a query
+   input — vector stores, caches) holds its index INSIDE the node instance. Use exactly ONE
+   instance per logical store and wire BOTH its ingest input and its query input on that same
+   node. NEVER split "store" and "retrieve" pipeline stages into two instances of the same
+   store component — each would keep a separate index and retrieval would find nothing. Two
+   instances are only valid when they point at distinct collections (differing config values).
 
 ## Common type strings (use these directly — do NOT call list_components for them)
 ChatInput, ChatOutput, AzureOpenAIModel (Azure LLM), Prompt (Prompt Template, the {var}
@@ -276,7 +287,11 @@ async def design_flow(request: str, mcp, llm, feedback: str | None = None,
             "\n\nThe user already aligned on this stage→component map — honor it ONE-TO-ONE: each "
             "stage becomes exactly ONE node. Do NOT expand a stage into several nodes (e.g. do "
             "not turn a single 'Gateway' stage into a Prompt + an LLM) and do not collapse "
-            "stages. Keep the stages DISTINCT and do not swap a valid choice. Verify every named "
+            "stages. EXCEPTION: when SEVERAL stages name the SAME stateful-store component "
+            "(e.g. a 'store/ingest' stage and a 'retrieve/search' stage both on one vector "
+            "store), they are two ROLES of ONE node — emit a single instance and wire both its "
+            "ingest and query inputs (hard rule 6). "
+            "Keep the stages DISTINCT and do not swap a valid choice. Verify every named "
             "`component` exists via get_component_schema; if a name is not a real catalog type "
             "(e.g. 'SQLExecutorComponent', or a user's custom 'LLM Gateway'), resolve it to the "
             "correct existing type for that role, or use a single `CustomComponent` placeholder "

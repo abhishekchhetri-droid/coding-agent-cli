@@ -281,6 +281,59 @@ class LangflowMCPClient:
                     break
         return set(re.findall(r"\{\s*([a-zA-Z_]\w*)\s*\}", template_str or ""))
 
+    @staticmethod
+    def _stateful_store_fields(schema: dict) -> tuple[str, str] | None:
+        """Detect the stateful-store schema shape; returns (ingest_field, query_field) or None.
+
+        A stateful store ROUND-TRIPS container data: a handle-typed input whose accepted types
+        intersect the component's own output types (what you ingest is what search returns) and
+        that is not the conversational Message type, PLUS a separate handle-typed query input of
+        a foreign type (disjoint from both the ingest types and the outputs; Tool inputs are the
+        agent-wiring concept, never a query). Shape-only — every vector store (FAISS, Chroma,
+        Qdrant, a future one) matches by construction, no component names involved.
+        """
+        tmpl = schema.get("template", {})
+        if not isinstance(tmpl, dict):
+            return None
+        out_types: set[str] = set()
+        for o in schema.get("outputs", []) or []:
+            out_types |= set(o.get("types") or o.get("output_types") or [])
+        if not out_types:
+            return None
+        handle_inputs = {
+            k: set(f["input_types"]) for k, f in tmpl.items()
+            if isinstance(f, dict) and f.get("input_types")
+        }
+        ingest = next(
+            (k for k, ts in handle_inputs.items() if (ts & out_types) and "Message" not in ts),
+            None,
+        )
+        if not ingest:
+            return None
+        ingest_ts = handle_inputs[ingest]
+        query_candidates = [
+            k for k, ts in handle_inputs.items()
+            if k != ingest and not (ts & ingest_ts) and not (ts & out_types) and "Tool" not in ts
+        ]
+        # Prefer a conversational (Message-accepting) input as the query handle.
+        query = next(
+            (k for k in query_candidates if "Message" in handle_inputs[k]),
+            query_candidates[0] if query_candidates else None,
+        )
+        return (ingest, query) if query else None
+
+    @staticmethod
+    def _value_config(node: dict) -> dict:
+        """Value-typed (non-handle) field values carried on an enriched node — the instance's
+        persistence identity (index/collection name, path, …). Bare design-time nodes carry no
+        values → empty config, so indistinguishable by construction."""
+        ntmpl = (node.get("data") or {}).get("node", {}).get("template", {})
+        out: dict = {}
+        for k, f in (ntmpl.items() if isinstance(ntmpl, dict) else []):
+            if isinstance(f, dict) and not f.get("input_types") and f.get("value") not in (None, ""):
+                out[k] = f.get("value")
+        return out
+
     def validate_design(self, nodes: list[dict], edges: list[dict],
                         node_templates: dict | None = None) -> list[str]:
         """Validate any node/edge graph against the live schema catalog.
@@ -320,6 +373,37 @@ class LangflowMCPClient:
                 )
             tmpl_str = node_templates.get(nid) or (node.get("template") if isinstance(node, dict) else "") or ""
             id_to_vars[nid] = self._node_var_handles(node, tmpl_str, schema)
+
+        # Rule 4: duplicate stateful-store instances. A store holds its index IN the node
+        # instance — splitting ingest and search across two indistinguishable instances means
+        # data ingested into one is invisible to the other. Detection is schema-shape only
+        # (_stateful_store_fields); instances with DIFFERING value-typed config (a distinct
+        # collection/index per node) are a legitimate multi-store flow and pass.
+        node_by_id = {n.get("id", ""): n for n in nodes}
+        by_type: dict[str, list[str]] = {}
+        for nid, rtype in id_to_type.items():
+            by_type.setdefault(rtype, []).append(nid)
+        for rtype, ids in by_type.items():
+            if len(ids) < 2:
+                continue
+            roles = self._stateful_store_fields(id_to_schema[ids[0]])
+            if not roles:
+                continue
+            ingest_f, query_f = roles
+            cfg_groups: dict[str, list[str]] = {}
+            for nid in ids:
+                cfg = json.dumps(self._value_config(node_by_id.get(nid, {})), sort_keys=True, default=str)
+                cfg_groups.setdefault(cfg, []).append(nid)
+            for dup_ids in cfg_groups.values():
+                if len(dup_ids) < 2:
+                    continue
+                violations.append(
+                    f"nodes {sorted(dup_ids)} ({rtype}): duplicate stateful-store instances with "
+                    f"identical (or empty) config — each keeps its OWN index, so data ingested into "
+                    f"one is invisible to the others. Merge into ONE node wiring both {ingest_f!r} "
+                    f"and {query_f!r} on it, or give each instance a distinct persistence key "
+                    f"(a differing value-typed config field)."
+                )
 
         # Track incoming edges per (target id, fieldName) for the required-input check.
         incoming: dict[str, set[str]] = {}
@@ -412,7 +496,7 @@ class LangflowMCPClient:
                     f"incompatible{suffix}"
                 )
 
-        # Rule 8: every required handle-typed input must have an incoming edge or a value.
+        # Rule 8: every required PURE-handle input must have an incoming edge or a value.
         for nid, schema in id_to_schema.items():
             tmpl = schema.get("template", {})
             node_tmpl = next(
@@ -426,6 +510,16 @@ class LangflowMCPClient:
                 its = f.get("input_types")
                 if not its:
                     continue  # value-typed required field — set directly, not via handle
+                # Mirror the post-build audit (_inject_node_check): only a PURE-handle field
+                # (type "other", non-model) must be wired. A value-capable field — a str that
+                # also exposes a Message handle (endpoints, deployments, API keys, index
+                # names) — is config: left empty at design time, injected from settings or
+                # filled by the user in the UI. Forcing an edge here is what pushed the
+                # designer into inventing TextInput feeder nodes. Model fields are excluded
+                # too — enrichment auto-wires them.
+                is_model = f.get("type") == "model" or "LanguageModel" in its
+                if is_model or f.get("type") != "other":
+                    continue
                 has_edge = fname in incoming.get(nid, set())
                 node_val = node_tmpl.get(fname, {}).get("value") if isinstance(node_tmpl, dict) else None
                 has_value = bool(node_val) or bool(f.get("value"))
@@ -783,6 +877,16 @@ class LangflowMCPClient:
             field_name = th.get("fieldName", "")
             if tgt_comp_type and field_name and tgt_comp_type in schemas:
                 tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
+                if not tmpl_field:
+                    # Dynamic fields ({var} handles materialized by apply_prompt_fields,
+                    # runtime-injected inputs) exist only on the node INSTANCE template,
+                    # never in the catalog — fall back to it so their handles get the same
+                    # correction. Without this the LLM-guessed handle survives, mismatches
+                    # the string the frontend computes, and the edge is silently removed.
+                    tmpl_field = (
+                        node_by_id.get(tgt_node_id, {}).get("data", {})
+                        .get("node", {}).get("template", {}).get(field_name, {})
+                    ) or {}
                 actual_type = tmpl_field.get("type")
                 if actual_type:
                     th["type"] = actual_type
