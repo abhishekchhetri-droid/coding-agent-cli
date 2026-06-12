@@ -15,6 +15,11 @@ from mcpbridge.redis_cache import RedisEntityCache
 
 logger = logging.getLogger(__name__)
 
+# Accepted input types for materialized prompt ``{var}`` handles. Single source of truth:
+# the validator (validate_design) and the offline injector (_inject_prompt_vars_local) both
+# read this, so the type they agree a var-handle accepts can never drift apart.
+_PROMPT_VAR_INPUT_TYPES = ["Message"]
+
 
 def _extract_text(obj: Any, depth: int = 0) -> str:
     """Walk Langflow run response tree to find the first non-trivial text value."""
@@ -203,6 +208,328 @@ class LangflowMCPClient:
             return candidates[0]
         return raw_type  # unknown — let caller raise
 
+    def find_bridges(self, src_types: set[str], tgt_types: set[str], limit: int = 3) -> list[dict]:
+        """Scan the live catalog for non-legacy components that can BRIDGE a type gap:
+        a component with an input accepting any of ``src_types`` AND an output emitting any
+        of ``tgt_types``. Used to suggest a converter when a direct edge is type-incompatible.
+        Fully catalog-driven — discovers whatever component fits today (Parser, TypeConvert,
+        a future rename) with nothing hardcoded. Returns up to ``limit`` matches, sorted by
+        type name for determinism: ``[{type, display_name, src:[...], tgt:[...]}]``."""
+        src_types = set(src_types)
+        tgt_types = set(tgt_types)
+        if not src_types or not tgt_types:
+            return []
+        schemas = self._fetch_component_schemas()
+        out: list[dict] = []
+        for key in sorted(schemas):
+            schema = schemas[key]
+            if not isinstance(schema, dict) or schema.get("legacy"):
+                continue
+            tmpl = schema.get("template", {})
+            accepts = any(
+                isinstance(f, dict) and f.get("input_types") and (src_types & set(f["input_types"]))
+                for f in (tmpl.values() if isinstance(tmpl, dict) else [])
+            )
+            if not accepts:
+                continue
+            emitted: set[str] = set()
+            for o in schema.get("outputs", []) or []:
+                emitted |= set(o.get("types") or o.get("output_types") or []) & tgt_types
+            if not emitted:
+                continue
+            out.append({
+                "type": key,
+                "display_name": schema.get("display_name", key),
+                "src": sorted(src_types & self._component_input_types(schema)),
+                "tgt": sorted(emitted),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _component_input_types(schema: dict) -> set[str]:
+        """Union of all handle-typed input_types declared on a component's template."""
+        types: set[str] = set()
+        tmpl = schema.get("template", {})
+        for f in (tmpl.values() if isinstance(tmpl, dict) else []):
+            if isinstance(f, dict) and f.get("input_types"):
+                types |= set(f["input_types"])
+        return types
+
+    def _node_var_handles(self, node: dict, template_str: str, schema: dict) -> set[str]:
+        """Var names a dynamic-fielded node materializes as input handles.
+
+        A component is dynamic-fielded when its template has a ``type == "prompt"`` field, or
+        any field flagged ``dynamic`` / ``real_time_refresh`` — the same schema-shape signal
+        ``apply_prompt_fields`` keys off (never a component name). For such a node, ``{var}``
+        tokens in its template string become extra input handles, so an edge may target one.
+        Non-dynamic components have no such handles → empty set."""
+        tmpl = schema.get("template", {})
+        is_dynamic = any(
+            isinstance(f, dict) and (f.get("type") == "prompt" or f.get("dynamic") or f.get("real_time_refresh"))
+            for f in (tmpl.values() if isinstance(tmpl, dict) else [])
+        )
+        if not is_dynamic:
+            return set()
+        if not template_str:
+            # Fall back to a prompt-type field's own value carried on an enriched node.
+            ntmpl = (node.get("data") or {}).get("node", {}).get("template", {})
+            for f in (ntmpl.values() if isinstance(ntmpl, dict) else []):
+                if isinstance(f, dict) and f.get("type") == "prompt" and f.get("value"):
+                    template_str = f["value"]
+                    break
+        return set(re.findall(r"\{\s*([a-zA-Z_]\w*)\s*\}", template_str or ""))
+
+    @staticmethod
+    def _stateful_store_fields(schema: dict) -> tuple[str, str] | None:
+        """Detect the stateful-store schema shape; returns (ingest_field, query_field) or None.
+
+        A stateful store ROUND-TRIPS container data: a handle-typed input whose accepted types
+        intersect the component's own output types (what you ingest is what search returns) and
+        that is not the conversational Message type, PLUS a separate handle-typed query input of
+        a foreign type (disjoint from both the ingest types and the outputs; Tool inputs are the
+        agent-wiring concept, never a query). Shape-only — every vector store (FAISS, Chroma,
+        Qdrant, a future one) matches by construction, no component names involved.
+        """
+        tmpl = schema.get("template", {})
+        if not isinstance(tmpl, dict):
+            return None
+        out_types: set[str] = set()
+        for o in schema.get("outputs", []) or []:
+            out_types |= set(o.get("types") or o.get("output_types") or [])
+        if not out_types:
+            return None
+        handle_inputs = {
+            k: set(f["input_types"]) for k, f in tmpl.items()
+            if isinstance(f, dict) and f.get("input_types")
+        }
+        ingest = next(
+            (k for k, ts in handle_inputs.items() if (ts & out_types) and "Message" not in ts),
+            None,
+        )
+        if not ingest:
+            return None
+        ingest_ts = handle_inputs[ingest]
+        query_candidates = [
+            k for k, ts in handle_inputs.items()
+            if k != ingest and not (ts & ingest_ts) and not (ts & out_types) and "Tool" not in ts
+        ]
+        # Prefer a conversational (Message-accepting) input as the query handle.
+        query = next(
+            (k for k in query_candidates if "Message" in handle_inputs[k]),
+            query_candidates[0] if query_candidates else None,
+        )
+        return (ingest, query) if query else None
+
+    @staticmethod
+    def _value_config(node: dict) -> dict:
+        """Value-typed (non-handle) field values carried on an enriched node — the instance's
+        persistence identity (index/collection name, path, …). Bare design-time nodes carry no
+        values → empty config, so indistinguishable by construction."""
+        ntmpl = (node.get("data") or {}).get("node", {}).get("template", {})
+        out: dict = {}
+        for k, f in (ntmpl.items() if isinstance(ntmpl, dict) else []):
+            if isinstance(f, dict) and not f.get("input_types") and f.get("value") not in (None, ""):
+                out[k] = f.get("value")
+        return out
+
+    def validate_design(self, nodes: list[dict], edges: list[dict],
+                        node_templates: dict | None = None) -> list[str]:
+        """Validate any node/edge graph against the live schema catalog.
+
+        Read-only, cache-based. Returns a list of human-readable violations (empty == valid).
+        Every rule and every fix-suggestion is derived from ``/api/v1/all`` at runtime — no
+        component names, no hardcoded type sets — so the same checker validates ANY flow shape.
+        ``node_templates`` maps node id → its prompt template string (the per-node templates the
+        designer attaches); used to know which ``{var}`` input handles a dynamic node exposes.
+        """
+        node_templates = node_templates or {}
+        schemas = self._fetch_component_schemas()
+        violations: list[str] = []
+
+        all_ids = {n.get("id", "") for n in nodes}
+        id_to_schema: dict[str, dict] = {}
+        id_to_type: dict[str, str] = {}
+        id_to_vars: dict[str, set[str]] = {}
+
+        for node in nodes:
+            if node.get("type") == "noteNode" or (node.get("data") or {}).get("type") in ("note", "noteNode"):
+                continue  # UI-only annotation, not a graph node
+            nid = node.get("id", "")
+            raw_type = (node.get("data") or {}).get("type") or node.get("type", "")
+            resolved = self._resolve_type(raw_type, schemas)
+            if resolved not in schemas:
+                violations.append(
+                    f"node {nid!r}: unknown component type {raw_type!r} — call list_components for the exact 'type' string"
+                )
+                continue
+            schema = schemas[resolved]
+            id_to_schema[nid] = schema
+            id_to_type[nid] = resolved
+            if schema.get("legacy"):
+                violations.append(
+                    f"node {nid!r} ({resolved}): legacy component — hard-blocked at build. Pick a modern equivalent."
+                )
+            tmpl_str = node_templates.get(nid) or (node.get("template") if isinstance(node, dict) else "") or ""
+            id_to_vars[nid] = self._node_var_handles(node, tmpl_str, schema)
+
+        # Rule 4: duplicate stateful-store instances. A store holds its index IN the node
+        # instance — splitting ingest and search across two indistinguishable instances means
+        # data ingested into one is invisible to the other. Detection is schema-shape only
+        # (_stateful_store_fields); instances with DIFFERING value-typed config (a distinct
+        # collection/index per node) are a legitimate multi-store flow and pass.
+        node_by_id = {n.get("id", ""): n for n in nodes}
+        by_type: dict[str, list[str]] = {}
+        for nid, rtype in id_to_type.items():
+            by_type.setdefault(rtype, []).append(nid)
+        for rtype, ids in by_type.items():
+            if len(ids) < 2:
+                continue
+            roles = self._stateful_store_fields(id_to_schema[ids[0]])
+            if not roles:
+                continue
+            ingest_f, query_f = roles
+            cfg_groups: dict[str, list[str]] = {}
+            for nid in ids:
+                cfg = json.dumps(self._value_config(node_by_id.get(nid, {})), sort_keys=True, default=str)
+                cfg_groups.setdefault(cfg, []).append(nid)
+            for dup_ids in cfg_groups.values():
+                if len(dup_ids) < 2:
+                    continue
+                violations.append(
+                    f"nodes {sorted(dup_ids)} ({rtype}): duplicate stateful-store instances with "
+                    f"identical (or empty) config — each keeps its OWN index, so data ingested into "
+                    f"one is invisible to the others. Merge into ONE node wiring both {ingest_f!r} "
+                    f"and {query_f!r} on it, or give each instance a distinct persistence key "
+                    f"(a differing value-typed config field)."
+                )
+
+        # Track incoming edges per (target id, fieldName) for the required-input check.
+        incoming: dict[str, set[str]] = {}
+
+        for edge in edges:
+            src_id = edge.get("source", "")
+            tgt_id = edge.get("target", "")
+            sh = self._parse_handle(edge.get("sourceHandle") or {})
+            th = self._parse_handle(edge.get("targetHandle") or {})
+            field_name = th.get("fieldName", "")
+            incoming.setdefault(tgt_id, set()).add(field_name)
+
+            # Rule 3: edges must reference real node ids.
+            if src_id not in all_ids:
+                violations.append(f"edge → {tgt_id!r}: unknown source node id {src_id!r}")
+                continue
+            if tgt_id not in all_ids:
+                violations.append(f"edge {src_id!r} → : unknown target node id {tgt_id!r}")
+                continue
+            # Deeper checks need both schemas resolved (unresolved nodes already flagged).
+            if src_id not in id_to_schema or tgt_id not in id_to_schema:
+                continue
+            # Tool edges: enrich_edges rewrites their source schema-driven, so skip
+            # output/compat here (still counts toward `incoming` for required-input check).
+            if field_name == "tools":
+                continue
+
+            src_schema = id_to_schema[src_id]
+            tgt_schema = id_to_schema[tgt_id]
+            tgt_tmpl = tgt_schema.get("template", {}) if isinstance(tgt_schema.get("template"), dict) else {}
+
+            field_in_tmpl = field_name in tgt_tmpl
+            field_is_var = field_name in id_to_vars.get(tgt_id, set())
+
+            # Rule 5: target field must exist (real template field or a {var} handle).
+            if field_name and not field_in_tmpl and not field_is_var:
+                avail = sorted(tgt_tmpl.keys())
+                extra = f"; or vars {sorted(id_to_vars.get(tgt_id, set()))}" if id_to_vars.get(tgt_id) else ""
+                violations.append(
+                    f"edge {src_id} → {tgt_id}: target field {field_name!r} not on {id_to_type[tgt_id]} "
+                    f"(fields: {avail}{extra})"
+                )
+                continue
+
+            # Accepted input types + value-typed detection.
+            if field_in_tmpl:
+                its = tgt_tmpl[field_name].get("input_types")
+                accepted = set(its or [])
+                value_typed = not its  # None/empty → value field, not handle-typed
+            else:  # a {var} handle
+                accepted = set(_PROMPT_VAR_INPUT_TYPES)
+                value_typed = False
+
+            # Rule 6: named source output must exist.
+            src_outputs = src_schema.get("outputs", []) or []
+            out_name = sh.get("name", "")
+            chosen = next((o for o in src_outputs if o.get("name") == out_name), None)
+            if out_name and chosen is None:
+                avail_outs = [
+                    {"name": o.get("name"), "types": o.get("types") or o.get("output_types") or []}
+                    for o in src_outputs
+                ]
+                violations.append(
+                    f"edge {src_id} → {tgt_id}: source output {out_name!r} not on {id_to_type[src_id]} "
+                    f"(outputs: {avail_outs})"
+                )
+                continue
+
+            # Rule 7: type compatibility. Skip value-typed fields (str/NestedDict/connection
+            # strings are not handle-typed in Langflow) and cases where we cannot determine types.
+            if value_typed:
+                continue
+            out_types = set((chosen or {}).get("types") or (chosen or {}).get("output_types") or [])
+            if out_types and accepted and not (out_types & accepted):
+                same_node = [
+                    o.get("name") for o in src_outputs
+                    if set(o.get("types") or o.get("output_types") or []) & accepted
+                ]
+                bridges = self.find_bridges(out_types, accepted)
+                parts: list[str] = []
+                if bridges:
+                    parts.append("compatible bridges in catalog: " + ", ".join(
+                        f"{b['display_name']} ({'/'.join(b['src'])}→{'/'.join(b['tgt'])})" for b in bridges
+                    ))
+                if same_node:
+                    parts.append("or use source output(s) " + ", ".join(repr(n) for n in same_node))
+                suffix = ("; " + "; ".join(parts)) if parts else ""
+                violations.append(
+                    f"edge {src_id}.{out_name} {sorted(out_types)} → {tgt_id}.{field_name} {sorted(accepted)}: "
+                    f"incompatible{suffix}"
+                )
+
+        # Rule 8: every required PURE-handle input must have an incoming edge or a value.
+        for nid, schema in id_to_schema.items():
+            tmpl = schema.get("template", {})
+            node_tmpl = next(
+                ((n.get("data") or {}).get("node", {}).get("template", {})
+                 for n in nodes if n.get("id") == nid),
+                {},
+            )
+            for fname, f in (tmpl.items() if isinstance(tmpl, dict) else []):
+                if not isinstance(f, dict) or not f.get("required"):
+                    continue
+                its = f.get("input_types")
+                if not its:
+                    continue  # value-typed required field — set directly, not via handle
+                # Mirror the post-build audit (_inject_node_check): only a PURE-handle field
+                # (type "other", non-model) must be wired. A value-capable field — a str that
+                # also exposes a Message handle (endpoints, deployments, API keys, index
+                # names) — is config: left empty at design time, injected from settings or
+                # filled by the user in the UI. Forcing an edge here is what pushed the
+                # designer into inventing TextInput feeder nodes. Model fields are excluded
+                # too — enrichment auto-wires them.
+                is_model = f.get("type") == "model" or "LanguageModel" in its
+                if is_model or f.get("type") != "other":
+                    continue
+                has_edge = fname in incoming.get(nid, set())
+                node_val = node_tmpl.get(fname, {}).get("value") if isinstance(node_tmpl, dict) else None
+                has_value = bool(node_val) or bool(f.get("value"))
+                if not has_edge and not has_value:
+                    violations.append(
+                        f"node {nid!r} ({id_to_type[nid]}): required input {fname!r} {its} "
+                        f"has no incoming edge or value"
+                    )
+        return violations
+
     def enrich_nodes(
         self,
         nodes: list[dict],
@@ -354,7 +681,7 @@ class LangflowMCPClient:
             tmpl[v] = {
                 "field_type": "str", "required": False, "placeholder": "", "list": False,
                 "show": True, "multiline": True, "value": "", "fileTypes": [], "file_path": "",
-                "name": v, "display_name": v, "advanced": False, "input_types": ["Message"],
+                "name": v, "display_name": v, "advanced": False, "input_types": list(_PROMPT_VAR_INPUT_TYPES),
                 "dynamic": False, "info": "", "load_from_db": False, "title_case": False,
                 "type": "str", "_input_type": "DefaultPromptField",
             }
@@ -550,6 +877,16 @@ class LangflowMCPClient:
             field_name = th.get("fieldName", "")
             if tgt_comp_type and field_name and tgt_comp_type in schemas:
                 tmpl_field = schemas[tgt_comp_type].get("template", {}).get(field_name, {})
+                if not tmpl_field:
+                    # Dynamic fields ({var} handles materialized by apply_prompt_fields,
+                    # runtime-injected inputs) exist only on the node INSTANCE template,
+                    # never in the catalog — fall back to it so their handles get the same
+                    # correction. Without this the LLM-guessed handle survives, mismatches
+                    # the string the frontend computes, and the edge is silently removed.
+                    tmpl_field = (
+                        node_by_id.get(tgt_node_id, {}).get("data", {})
+                        .get("node", {}).get("template", {}).get(field_name, {})
+                    ) or {}
                 actual_type = tmpl_field.get("type")
                 if actual_type:
                     th["type"] = actual_type
@@ -613,10 +950,24 @@ class LangflowMCPClient:
                         tgt_input_types = set(th.get("inputTypes") or [])
                         chosen = next((o for o in src_outputs if o.get("name") == sh.get("name")), None)
                         if chosen is None:
-                            chosen = next(
+                            typed = next(
                                 (o for o in src_outputs if tgt_input_types & set(o.get("types") or [])),
                                 None,
-                            ) or src_outputs[0]
+                            )
+                            if typed is None and tgt_input_types:
+                                # No name match AND no type intersection — last-resort fallback to
+                                # the first output keeps template-cloned edges flowing, but the
+                                # design-time validator should have blocked this. Diagnose it.
+                                # Guarded by tgt_input_types so value-typed fields stay silent.
+                                logger.warning(
+                                    "enrich_edges incompatible fallback: %s.%s → %s.%s "
+                                    "(target accepts %s, source outputs %s)",
+                                    src_comp_type, sh.get("name"),
+                                    edge.get("target", ""), th.get("fieldName", ""),
+                                    sorted(tgt_input_types),
+                                    [o.get("name") for o in src_outputs],
+                                )
+                            chosen = typed or src_outputs[0]
                         sh["name"] = chosen.get("name", sh.get("name"))
                         sh["output_types"] = chosen.get("types", sh.get("output_types"))
                         sh["dataType"] = src_comp_type

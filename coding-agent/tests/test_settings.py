@@ -33,5 +33,5 @@ def test_settings_defaults():
         from config.settings import Settings
         s = Settings()
         assert s.langflow_base_url == "http://localhost:7860"
-        assert s.llm_provider == "azure_openai"
+        assert s.llm_provider == "azure_anthropic"
         assert s.llm_supports_reasoning is False

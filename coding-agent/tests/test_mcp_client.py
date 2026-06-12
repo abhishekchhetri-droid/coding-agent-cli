@@ -373,3 +373,85 @@ def test_apply_prompt_fields_noops_without_prompt_field_or_template():
     empty_prompt = _prompt_node(value="")  # no value, no design template
     c.apply_prompt_fields([plain, empty_prompt])  # must not call endpoint or raise
     assert "custom_fields" not in plain["data"]["node"] or not plain["data"]["node"]["custom_fields"]
+
+
+def _edge_node(nid, comp_type, node_schema):
+    """Enriched node shape enrich_edges expects: data.type + data.node schema."""
+    return {"id": nid, "type": "genericNode", "data": {"type": comp_type, "node": node_schema}}
+
+
+def test_enrich_edges_warns_on_incompatible_fallback(caplog):
+    """No name match AND no type intersection → first-output fallback, with a diagnostic warning."""
+    import logging
+    schemas = {
+        "Src": {"template": {}, "outputs": [{"name": "o1", "types": ["Data"]}]},
+        "Tgt": {"template": {"f": {"type": "other", "input_types": ["Message"]}}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    nodes = [
+        _edge_node("s", "Src", {"outputs": [{"name": "o1", "types": ["Data"]}]}),
+        _edge_node("t", "Tgt", {"template": {"f": {"type": "other", "input_types": ["Message"]}}}),
+    ]
+    edges = [{
+        "source": "s", "target": "t",
+        "sourceHandle": {"id": "s", "name": "wrong", "output_types": ["Data"]},
+        "targetHandle": {"id": "t", "fieldName": "f", "inputTypes": ["Message"], "type": "other"},
+    }]
+    with caplog.at_level(logging.WARNING, logger="mcpbridge.client"):
+        c.enrich_edges(edges, nodes)
+    assert any("incompatible fallback" in r.message for r in caplog.records)
+
+
+def test_enrich_edges_fixes_dynamic_var_handle_from_node_instance():
+    """Edges into dynamic {var} fields (context/question on a Prompt) were silently removed
+    by the frontend: the var field exists only on the node INSTANCE template (materialized by
+    apply_prompt_fields), not in the catalog schema, so the targetHandle fix skipped it and
+    the LLM-guessed handle survived — mismatching the handle string the frontend computes.
+    enrich_edges must fall back to the instance template for any field the catalog lacks."""
+    import json as _json
+    schemas = {
+        "Parser": {"template": {}, "outputs": [{"name": "parsed_text", "types": ["Message"]}]},
+        # Catalog Prompt has ONLY the prompt-type field — no 'context'.
+        "Prompt": {"template": {"template": {"type": "prompt"}}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    nodes = [
+        _edge_node("PR-1", "Parser", {"outputs": [{"name": "parsed_text", "types": ["Message"]}]}),
+        # Instance template carries the materialized DefaultPromptField for {context}.
+        _edge_node("P-1", "Prompt", {"template": {
+            "template": {"type": "prompt", "value": "ctx: {context}"},
+            "context": {"type": "str", "input_types": ["Message"], "_input_type": "DefaultPromptField"},
+        }}),
+    ]
+    edges = [{
+        "source": "PR-1", "target": "P-1",
+        "sourceHandle": {"id": "PR-1", "name": "parsed_text", "output_types": ["Message"]},
+        # LLM-guessed handle: wrong type + wrong inputTypes — must be corrected, not passed through.
+        "targetHandle": {"id": "P-1", "fieldName": "context", "inputTypes": ["Message", "Text"], "type": "prompt"},
+    }]
+    out = c.enrich_edges(edges, nodes)
+    th = _json.loads(out[0]["targetHandle"].replace("œ", '"'))
+    assert th["type"] == "str"
+    assert th["inputTypes"] == ["Message"]
+
+
+def test_enrich_edges_silent_on_value_typed_field(caplog):
+    """Value-typed target field (input_types None) → no warning even on name mismatch."""
+    import logging
+    schemas = {
+        "Src": {"template": {}, "outputs": [{"name": "o1", "types": ["Data"]}]},
+        "Tgt": {"template": {"v": {"type": "str", "input_types": None}}, "outputs": []},
+    }
+    c = _client_with_schemas(schemas)
+    nodes = [
+        _edge_node("s", "Src", {"outputs": [{"name": "o1", "types": ["Data"]}]}),
+        _edge_node("t", "Tgt", {"template": {"v": {"type": "str", "input_types": None}}}),
+    ]
+    edges = [{
+        "source": "s", "target": "t",
+        "sourceHandle": {"id": "s", "name": "wrong", "output_types": ["Data"]},
+        "targetHandle": {"id": "t", "fieldName": "v", "type": "str"},
+    }]
+    with caplog.at_level(logging.WARNING, logger="mcpbridge.client"):
+        c.enrich_edges(edges, nodes)
+    assert not any("incompatible fallback" in r.message for r in caplog.records)

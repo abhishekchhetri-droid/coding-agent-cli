@@ -19,6 +19,9 @@ Design rules the sub-agent enforces (general, not per-case):
 import json
 
 _DESIGNER_MAX_ITERS = 10
+# Each design_invalid rejection grants one extra iteration (capped at _DESIGNER_MAX_ITERS + 3)
+# so machine-validation never starves the sub-agent's exploration budget.
+_MAX_VALIDATION_RETRIES = 3
 
 DESIGNER_SYSTEM_PROMPT = """You are a Langflow flow-design specialist. Given a build request,
 produce a correct node/edge graph and return it via `submit_design`. You do NOT build or
@@ -41,7 +44,12 @@ call create_flow — you only design.
 3. Match the described data flow as DISTINCT stages. If the user says one component emits
    text and a separate one consumes/executes it (e.g. "LLM returns SQL, then run that SQL"),
    wire them as separate nodes. Never collapse into one self-contained *Agent.
-4. Every REQUIRED input of every node must have a source edge.
+4. Wire every REQUIRED pure-DATA input (schema field type `other` — Data/DataFrame/
+   Embeddings/Tool/...). Config and credential fields are NOT data inputs: endpoints,
+   deployment names, API keys, api versions, index/collection names — any `str` field, even
+   when required and even when it exposes a Message handle — must be LEFT EMPTY and UNWIRED.
+   They are injected from settings after design or filled by the user in the Langflow UI.
+   NEVER create passthrough feeder nodes (TextInput or similar) to fill a config field.
 5. TYPE-CHECK every edge BEFORE you submit. For each edge confirm from `get_component_schema`
    that (a) the target FIELD exists on the target component, and (b) the source output's type
    is listed in that field's `input_types`. If your chosen component has no field that fits the
@@ -49,6 +57,14 @@ call create_flow — you only design.
    component — pick one whose schema actually fits the stage's role (use `list_components`).
    A node that ends a pipeline (e.g. ChatOutput) must be reachable from ChatInput through the
    stages — never leave a stage with its output going nowhere or its real input port empty.
+   `submit_design` is machine-validated against the live schemas; a `design_invalid` result
+   lists violations with catalog-discovered fixes — resolve all of them and resubmit.
+6. A STATEFUL STORE (any component whose schema has both a data-ingest input and a query
+   input — vector stores, caches) holds its index INSIDE the node instance. Use exactly ONE
+   instance per logical store and wire BOTH its ingest input and its query input on that same
+   node. NEVER split "store" and "retrieve" pipeline stages into two instances of the same
+   store component — each would keep a separate index and retrieval would find nothing. Two
+   instances are only valid when they point at distinct collections (differing config values).
 
 ## Common type strings (use these directly — do NOT call list_components for them)
 ChatInput, ChatOutput, AzureOpenAIModel (Azure LLM), Prompt (Prompt Template, the {var}
@@ -205,6 +221,13 @@ def render_design(spec: dict) -> str:
         lines.append(f"\n**Prompt template:** `{spec['prompt_template']}`")
         if spec.get("vars"):
             lines.append("**Prompt vars:** " + ", ".join(f"`{{{v}}}`" for v in spec["vars"]))
+    # Validation warnings the sub-agent could not resolve within its retry budget — surfaced so
+    # the human confirm gate sees them (never auto-approved when present).
+    violations = spec.get("violations") or []
+    if violations:
+        lines.append("\n**⚠ Unresolved validation warnings:**")
+        for v in violations:
+            lines.append(f"- {v}")
     return "\n".join(lines)
 
 
@@ -264,7 +287,11 @@ async def design_flow(request: str, mcp, llm, feedback: str | None = None,
             "\n\nThe user already aligned on this stage→component map — honor it ONE-TO-ONE: each "
             "stage becomes exactly ONE node. Do NOT expand a stage into several nodes (e.g. do "
             "not turn a single 'Gateway' stage into a Prompt + an LLM) and do not collapse "
-            "stages. Keep the stages DISTINCT and do not swap a valid choice. Verify every named "
+            "stages. EXCEPTION: when SEVERAL stages name the SAME stateful-store component "
+            "(e.g. a 'store/ingest' stage and a 'retrieve/search' stage both on one vector "
+            "store), they are two ROLES of ONE node — emit a single instance and wire both its "
+            "ingest and query inputs (hard rule 6). "
+            "Keep the stages DISTINCT and do not swap a valid choice. Verify every named "
             "`component` exists via get_component_schema; if a name is not a real catalog type "
             "(e.g. 'SQLExecutorComponent', or a user's custom 'LLM Gateway'), resolve it to the "
             "correct existing type for that role, or use a single `CustomComponent` placeholder "
@@ -276,7 +303,11 @@ async def design_flow(request: str, mcp, llm, feedback: str | None = None,
         opening += f"\n\nThe previous design was rejected. Revise per this feedback:\n{feedback}"
     messages: list[dict] = [{"role": "user", "content": opening}]
 
-    for _ in range(_DESIGNER_MAX_ITERS):
+    budget = _DESIGNER_MAX_ITERS
+    validation_retries = 0
+    iters = 0
+    while iters < budget:
+        iters += 1
         resp = await llm.complete(messages, _DESIGNER_TOOLS, system=DESIGNER_SYSTEM_PROMPT)
         tool_calls = resp.get("tool_calls") or []
         if not tool_calls:
@@ -289,13 +320,36 @@ async def design_flow(request: str, mcp, llm, feedback: str | None = None,
         for tc in tool_calls:
             name, args = tc["name"], (tc.get("arguments") or {})
             if name == "submit_design":
-                return {
+                spec = {
                     "summary": args.get("summary", ""),
                     "nodes": args.get("nodes", []),
                     "edges": args.get("edges", []),
                     "prompt_template": args.get("prompt_template", ""),
                     "vars": args.get("vars", []),
                 }
+                violations = mcp.validate_design(
+                    spec["nodes"], spec["edges"], node_templates=_spec_node_templates(spec)
+                )
+                if not isinstance(violations, list):  # MagicMock / stub guard
+                    violations = []
+                if not violations:
+                    return spec  # valid — accept mid-batch (no further turns needed)
+                validation_retries += 1
+                if validation_retries > _MAX_VALIDATION_RETRIES:
+                    # Out of retries — surface the spec WITH violations; the human confirm
+                    # gate decides rather than hard-failing the loop.
+                    spec["violations"] = violations
+                    return spec
+                # Rejection: feed violations back as this call's tool_result (pairing intact)
+                # and grant +1 iteration so validation never starves exploration.
+                messages.append(_tool_result_message(tc["id"], json.dumps({
+                    "error": "design_invalid",
+                    "violations": violations,
+                    "note": "Fix every violation and resubmit. Bridge suggestions come from the "
+                            "live catalog — verify the chosen one with get_component_schema before wiring.",
+                })))
+                budget = min(budget + 1, _DESIGNER_MAX_ITERS + _MAX_VALIDATION_RETRIES)
+                continue
             if name == "get_component_schema":
                 result = json.dumps(mcp.get_component_schema(args.get("type_name", "")))
             elif name == "list_components":
@@ -305,3 +359,15 @@ async def design_flow(request: str, mcp, llm, feedback: str | None = None,
             messages.append(_tool_result_message(tc["id"], result))
 
     return {"error": "designer did not converge within iteration budget"}
+
+
+def _spec_node_templates(spec: dict) -> dict:
+    """node id → prompt template string for validation. Per-node ``template`` is the normal
+    multi-prompt case; the design-level ``prompt_template`` is the single-prompt fallback,
+    applied to any node lacking its own (harmless for non-dynamic nodes — they ignore it)."""
+    pt = spec.get("prompt_template", "")
+    out: dict[str, str] = {}
+    for n in spec.get("nodes", []):
+        if isinstance(n, dict) and n.get("id"):
+            out[n["id"]] = n.get("template") or pt
+    return out
