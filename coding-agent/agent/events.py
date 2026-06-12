@@ -8,6 +8,7 @@ of that it emits three *structured* signals through an EventSink:
   - tool_call(name, arguments) — a tool is about to run
   - flow_built(flow_id)        — a flow was created/updated/built (drives the canvas)
   - usage(metrics)             — end-of-turn token/timing totals (drives the token meter)
+  - notice(markdown)           — an intermediate artifact (proposed design, plan) to show in chat
   - final(text)                — the assistant's end-of-turn answer
 
 ConsoleSink is a no-op: the CLI already renders everything via console.print, so the
@@ -196,6 +197,7 @@ class EventSink(Protocol):
     def flow_built(self, flow_id: str | None, graph: dict | None = None) -> None: ...
     def flow_modified(self, graph: dict | None = None) -> None: ...
     def usage(self, metrics: dict) -> None: ...
+    def notice(self, markdown: str | None) -> None: ...
     def final(self, text: str | None) -> None: ...
 
 
@@ -216,6 +218,9 @@ class ConsoleSink:
 
     def usage(self, metrics: dict) -> None:
         pass  # CLI already prints the token/timing line via console.print
+
+    def notice(self, markdown: str | None) -> None:
+        pass  # CLI already renders the design/plan Panel via console.print
 
     def final(self, text: str | None) -> None:
         pass

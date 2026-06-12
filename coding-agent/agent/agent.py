@@ -1279,10 +1279,12 @@ async def run_turn(
                     if spec.get("error"):
                         result = json.dumps(spec)
                     else:
+                        _design_md = designer.render_design(spec)
                         console.print(Panel(
-                            Markdown(designer.render_design(spec)),
+                            Markdown(_design_md),
                             title="[bold]Proposed Design[/bold]", border_style="cyan",
                         ))
+                        sink.notice(f"### 🧩 Proposed Design\n\n{_design_md}")  # show in web chat
                         # Headless (web): no stdin to read a y/n, so auto-approve — the user
                         # already requested the build through chat.
                         approve = _plan_confirmed or not _interactive
@@ -1327,10 +1329,12 @@ async def run_turn(
                     if _todos_changed and todos:
                         # Show the plan to the user only when it actually changes (a
                         # no-op re-call renders nothing — avoids panel spam / loops).
+                        _todos_md = planning.render_todos(todos)
                         console.print(Panel(
-                            Markdown(planning.render_todos(todos)),
+                            Markdown(_todos_md),
                             title="[bold]Plan[/bold]", border_style="cyan",
                         ))
+                        sink.notice(f"### 📋 Plan\n\n{_todos_md}")  # show in web chat
                         # Confirm-gate ONCE per request, only for a real multi-step
                         # plan. After approval the agent auto-locks and won't re-prompt.
                         needs_gate = (

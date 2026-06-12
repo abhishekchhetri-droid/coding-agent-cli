@@ -118,19 +118,30 @@ class AGUISink:
         self.usage_metrics = {**metrics, "session_total": self.session_tokens}
         self._emit_state()
 
-    def final(self, text: str | None) -> None:
-        if not text:
-            return
+    def _emit_message(self, text: str) -> None:
+        """Stream one complete assistant chat message (START/CONTENT/END)."""
         mid = uuid.uuid4().hex
         self._q.put_nowait(TextMessageStartEvent(
             type=EventType.TEXT_MESSAGE_START, message_id=mid, role="assistant",
         ))
         self._q.put_nowait(TextMessageContentEvent(
-            type=EventType.TEXT_MESSAGE_CONTENT, message_id=mid, delta=text or "",
+            type=EventType.TEXT_MESSAGE_CONTENT, message_id=mid, delta=text,
         ))
         self._q.put_nowait(TextMessageEndEvent(
             type=EventType.TEXT_MESSAGE_END, message_id=mid,
         ))
+
+    def notice(self, markdown: str | None) -> None:
+        # Intermediate artifacts (proposed design, plan) the CLI shows as a Rich Panel —
+        # surface them in the web chat as their own assistant message. Display only: no
+        # turn-stop, no state, the build still proceeds in the same turn.
+        if markdown:
+            self._emit_message(markdown)
+
+    def final(self, text: str | None) -> None:
+        if not text:
+            return
+        self._emit_message(text)
 
 
 @asynccontextmanager
