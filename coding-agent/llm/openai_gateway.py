@@ -25,11 +25,22 @@ def _strip_private(d: dict) -> dict:
 class OpenAIGatewayProvider(LLMProvider):
     """OpenAI-compatible API via a corporate LLM gateway (api-key + workspacename headers).
 
-    Caching note: unlike azure_anthropic, there is no cache_control breakpoint to set. The
-    gateway automatically caches the longest common prefix of requests (typically ≥1024 tokens);
-    we just (a) keep the prefix stable — the agent already tails volatile tools and appends live
-    state as a trailing message — and (b) pass ``prompt_cache_key`` to route same-prefix requests
-    to the same cache node. Hits come back via usage.prompt_tokens_details.cached_tokens.
+    CACHING — depends on the backend model + gateway, and is NOT settled yet:
+
+    * If the gateway fronts an OpenAI model: caching is automatic (longest-common-prefix, ≥~1024
+      tokens); ``prompt_cache_key`` routes it and ``prompt_cache_retention`` extends it.
+    * If the gateway fronts a Claude/Sonnet model (our case): Anthropic caching is NOT automatic
+      and ``prompt_cache_key`` / ``prompt_cache_retention`` are not Anthropic concepts (likely
+      no-ops). Claude only caches what is marked with ``cache_control`` breakpoints — see
+      azure_anthropic.py. Whether that works through this OpenAI-shaped path then hinges on the
+      gateway: either it auto-injects breakpoints (we do nothing) OR it forwards ``cache_control``
+      we supply (we'd have to inject breakpoints into the OpenAI message/tool blocks ourselves —
+      NOT yet implemented here, so on such a gateway caching silently won't happen).
+
+    The cache-param kwargs below are sent unconditionally because they are harmless no-ops when
+    unsupported. ``usage.prompt_tokens_details.cached_tokens`` is the read-back signal IF the
+    gateway maps cache usage into OpenAI's usage shape (LiteLLM-style proxies do). Confirm the
+    gateway's caching behaviour for Claude before relying on any of this.
     """
 
     def __init__(self, settings: Settings) -> None:
