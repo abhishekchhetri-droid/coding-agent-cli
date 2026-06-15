@@ -94,6 +94,74 @@ def normalize_stages(raw) -> list[dict]:
     return stages
 
 
+def _stage_output_types(schema: dict) -> set[str]:
+    """Union of all output types a component emits."""
+    out: set[str] = set()
+    for o in schema.get("outputs", []) or []:
+        out |= set(o.get("types") or o.get("output_types") or [])
+    return out
+
+
+def verify_stages(stages: list[dict], mcp) -> list[dict]:
+    """Schema-driven verification of a proposed stage map (mutates + returns ``stages``).
+
+    Adaptive, never use-case-specific — every check reads the live catalog:
+      * An `ok` stage whose component does not resolve to a real catalog type is flipped to
+        `ask` (the existing ask→loop re-resolves it with the user — works for any custom name).
+      * An `ok` stage whose component is `legacy: true` is flipped to `ask`, with non-legacy
+        alternatives discovered from the catalog by matching the legacy component's I/O signature.
+      * Soft, non-blocking chainability hint: for consecutive resolved stages, if no output of
+        stage N intersects any input of stage N+1 AND no bridge component exists, annotate the
+        later stage so the incompatibility surfaces before design even starts. Soft because
+        stage order ≠ exact wiring; the hard check stays in the designer gate.
+    """
+    try:
+        schemas = mcp._fetch_component_schemas()
+    except Exception:
+        return stages  # catalog unreachable — skip verification rather than block the loop
+
+    for s in stages:
+        if s["status"] != "ok" or not s.get("component"):
+            continue
+        resolved = mcp._resolve_type(s["component"], schemas)
+        if resolved not in schemas:
+            s["status"] = "ask"
+            s["question"] = (
+                f"{s['component']!r} for stage '{s['stage']}' is not a known catalog component — "
+                f"which component should handle this stage?"
+            )
+            continue
+        if schemas[resolved].get("legacy"):
+            sig_in = mcp._component_input_types(schemas[resolved])
+            sig_out = _stage_output_types(schemas[resolved])
+            alts = mcp.find_bridges(sig_in, sig_out) if (sig_in and sig_out) else []
+            alt_txt = ", ".join(a["display_name"] for a in alts) if alts else "a non-legacy equivalent"
+            s["status"] = "ask"
+            s["question"] = (
+                f"{resolved} is legacy (hard-blocked at build) for stage '{s['stage']}' — "
+                f"use {alt_txt} instead. Which component?"
+            )
+            continue
+        s["component"] = resolved  # normalize to the canonical catalog key
+
+    # Chainability hint over consecutive still-resolved stages.
+    ok = [s for s in stages if s["status"] == "ok" and s.get("component") in schemas]
+    for a, b in zip(ok, ok[1:]):
+        a_out = _stage_output_types(schemas[a["component"]])
+        b_in = mcp._component_input_types(schemas[b["component"]])
+        if not a_out or not b_in:
+            continue  # can't reason about untyped value-only stages
+        if a_out & b_in:
+            continue
+        if mcp.find_bridges(a_out, b_in):
+            continue  # a converter exists; design time can insert it
+        b["hint"] = (
+            f"⚠ no direct type path {a['component']}→{b['component']}; "
+            f"a converter stage may be inserted at design time"
+        )
+    return stages
+
+
 def split(stages: list[dict]) -> tuple[list[dict], list[dict]]:
     """Partition into (resolved_ok_stages, open_questions). open_questions carry stage+question."""
     resolved = [s for s in stages if s["status"] == "ok"]
@@ -116,6 +184,8 @@ def render_pipeline(stages: list[dict]) -> str:
             if s.get("source"):
                 tail += f" ← {s['source']}"
             lines.append(f"{i}. **{s['stage']}** → {tail}")
+            if s.get("hint"):
+                lines.append(f"   - {s['hint']}")
         else:
             q = s.get("question") or "needs a decision"
             lines.append(f"{i}. **{s['stage']}** → ❓ _{q}_")

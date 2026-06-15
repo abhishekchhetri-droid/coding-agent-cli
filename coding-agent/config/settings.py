@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     )
 
     # LLM provider
-    llm_provider: str = "azure_openai"
+    llm_provider: str = "azure_anthropic"
     llm_supports_reasoning: bool = False
 
     # Azure OpenAI

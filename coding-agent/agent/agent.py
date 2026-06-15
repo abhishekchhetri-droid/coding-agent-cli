@@ -650,7 +650,7 @@ async def run_turn(
                         for o in n.get("data", {}).get("node", {}).get("outputs", [])
                     )
 
-                def _enrich_create_data(data: dict, from_design: bool = False) -> dict:
+                def _enrich_create_data(data: dict, from_design: bool = False, strict: bool = True) -> dict:
                     # ``from_design``: the build came from an approved design_flow design
                     # (user already reviewed the exact node/edge graph). The design is
                     # AUTHORITATIVE — skip the structural rewrites below (singleton dedup,
@@ -799,6 +799,20 @@ async def run_turn(
                     # node without its own.
                     mcp.apply_prompt_fields(data["nodes"], _prompt_template)
                     data["edges"] = mcp.ensure_tool_edges(data["nodes"], data.get("edges", []))
+                    # Schema-driven safety net: re-verify the assembled graph against the live
+                    # catalog before edges are serialized. Cheap (cached schemas); should never
+                    # fire for designer-gated specs, but catches hand-built create_flow payloads.
+                    _violations = mcp.validate_design(
+                        data["nodes"], data.get("edges", []), node_templates=_node_templates
+                    )
+                    if not isinstance(_violations, list):  # MagicMock / stub guard
+                        _violations = []
+                    if _violations:
+                        if strict:
+                            raise ValueError("design validation failed: " + "; ".join(_violations))
+                        console.print(
+                            "[yellow]⚠ design validation warnings:[/yellow] " + "; ".join(_violations)
+                        )
                     if "edges" in data:
                         data["edges"] = mcp.enrich_edges(data["edges"], data["nodes"])
                     mcp.fix_selected_outputs(data["nodes"], data.get("edges", []))
@@ -1062,7 +1076,8 @@ async def run_turn(
                             console.print(f"[dim]↳ update_flow mode: {mode}[/dim]")
 
                             if mode == "full_replace":
-                                payload_data = _enrich_create_data(payload_data)
+                                # Existing flows / template payloads carry quirks — warn only.
+                                payload_data = _enrich_create_data(payload_data, strict=False)
                                 _intended_edges = list(payload_data.get("edges", []))
                             else:
                                 payload_data = _enrich_update_merge(existing_data, payload_data)
@@ -1246,6 +1261,9 @@ async def run_turn(
                     # to scratchpad, and tell the model to ask the user about ambiguous stages
                     # (or proceed to design_flow once none remain). This is the ask→loop step.
                     stages = pipeline.normalize_stages(args.get("stages"))
+                    # Schema-driven verification: flip unknown/legacy components to `ask`
+                    # (with catalog-discovered alternatives) and add soft chainability hints.
+                    stages = pipeline.verify_stages(stages, mcp)
                     console.print(Panel(
                         Markdown(pipeline.render_pipeline(stages)),
                         title="[bold]Proposed Pipeline[/bold]", border_style="cyan",
@@ -1286,8 +1304,9 @@ async def run_turn(
                         ))
                         sink.notice(f"### 🧩 Proposed Design\n\n{_design_md}")  # show in web chat
                         # Headless (web): no stdin to read a y/n, so auto-approve — the user
-                        # already requested the build through chat.
-                        approve = _plan_confirmed or not _interactive
+                        # already requested the build through chat. But unresolved validation
+                        # warnings always force the gate, even when auto-confirmed (main rule).
+                        approve = (_plan_confirmed or not _interactive) and not spec.get("violations")
                         if not approve:
                             try:
                                 answer = console.input(

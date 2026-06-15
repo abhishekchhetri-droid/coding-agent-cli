@@ -1,4 +1,62 @@
 from agent import pipeline
+from mcpbridge.client import LangflowMCPClient
+
+# Small catalog for schema-driven verify_stages tests. Emitter/Sink carry isolated types
+# (Audio/Vector) with no bridge between them, to exercise the chainability hint.
+_CATALOG = {
+    "ChatInput": {"display_name": "Chat Input", "template": {}, "outputs": [{"name": "message", "types": ["Message"]}]},
+    "VectorStore": {"display_name": "Vector Store", "template": {"q": {"type": "str", "input_types": ["Message"]}}, "outputs": [{"name": "search_results", "types": ["Data"]}]},
+    "Parser": {"display_name": "Parser", "template": {"input_data": {"type": "other", "input_types": ["Data"]}}, "outputs": [{"name": "parsed", "types": ["Message"]}]},
+    "LegacyThing": {"display_name": "Legacy Thing", "legacy": True, "template": {"in": {"type": "str", "input_types": ["Message"]}}, "outputs": [{"name": "out", "types": ["Message"]}]},
+    "ValueField": {"display_name": "Value Field", "template": {"v": {"type": "str", "input_types": ["Message"]}}, "outputs": [{"name": "out", "types": ["Message"]}]},
+    "Emitter": {"display_name": "Emitter", "template": {"in": {"type": "str", "input_types": ["Message"]}}, "outputs": [{"name": "out", "types": ["Audio"]}]},
+    "Sink": {"display_name": "Sink", "template": {"in": {"type": "other", "input_types": ["Vector"]}}, "outputs": []},
+}
+
+
+def _mcp():
+    c = LangflowMCPClient.__new__(LangflowMCPClient)
+    c._component_schema_cache = dict(_CATALOG)
+    return c
+
+
+def test_verify_stages_flips_unknown_component_to_ask():
+    stages = pipeline.normalize_stages([{"stage": "x", "component": "NotReal", "status": "ok"}])
+    out = pipeline.verify_stages(stages, _mcp())
+    assert out[0]["status"] == "ask" and "NotReal" in out[0]["question"]
+
+
+def test_verify_stages_flips_legacy_with_discovered_alternative():
+    stages = pipeline.normalize_stages([{"stage": "x", "component": "LegacyThing", "status": "ok"}])
+    out = pipeline.verify_stages(stages, _mcp())
+    assert out[0]["status"] == "ask"
+    assert "legacy" in out[0]["question"] and "instead" in out[0]["question"]
+
+
+def test_verify_stages_normalizes_resolved_component():
+    stages = pipeline.normalize_stages([{"stage": "x", "component": "Vector Store", "status": "ok"}])
+    out = pipeline.verify_stages(stages, _mcp())
+    assert out[0]["status"] == "ok" and out[0]["component"] == "VectorStore"
+
+
+def test_verify_stages_chainability_hint_is_soft_and_nonblocking():
+    stages = pipeline.normalize_stages([
+        {"stage": "a", "component": "Emitter", "status": "ok"},
+        {"stage": "b", "component": "Sink", "status": "ok"},
+    ])
+    out = pipeline.verify_stages(stages, _mcp())
+    assert any(s.get("hint") for s in out)          # incompatibility surfaced
+    assert all(s["status"] == "ok" for s in out)    # but not blocked
+
+
+def test_verify_stages_no_hint_when_bridge_exists():
+    # VectorStore(Data) → ValueField(Message): no direct path, but Parser bridges Data→Message.
+    stages = pipeline.normalize_stages([
+        {"stage": "a", "component": "VectorStore", "status": "ok"},
+        {"stage": "b", "component": "ValueField", "status": "ok"},
+    ])
+    out = pipeline.verify_stages(stages, _mcp())
+    assert not any(s.get("hint") for s in out)
 
 
 def test_split_partitions_ok_and_ask():
