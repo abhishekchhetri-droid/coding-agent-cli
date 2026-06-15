@@ -36,6 +36,17 @@ class Settings(BaseSettings):
     azure_anthropic_api_key: str = ""
     azure_anthropic_deployment: str = "claude-sonnet-4-6"
 
+    # OpenAI-compatible corporate gateway (LLM_PROVIDER=openai_gateway). Auth via an `api-key`
+    # header (not bearer) plus an optional workspace header. Prompt caching is automatic on the
+    # gateway side; the cache key/retention just route + extend it (see llm/openai_gateway.py).
+    llmgw_api_key: str = ""
+    llmgw_api_base: str = ""
+    llmgw_model: str = ""
+    llmgw_workspace: str = ""
+    llmgw_workspace_header: str = "workspacename"
+    llmgw_prompt_cache_key: str = ""
+    llmgw_prompt_cache_retention: str = ""  # "" (off) | "in_memory" | "24h"
+
     # Redis entity cache
     redis_url: str = Field(default="", validation_alias="REDIS_URL")
     redis_sync_interval: int = Field(default=60, validation_alias="REDIS_SYNC_INTERVAL")

@@ -47,7 +47,7 @@ LANGFLOW_BASE_URL=http://localhost:7860        # default
 LANGFLOW_MCP_PATH=/path/to/langflow-mcp/dist/mcp/index.js
 
 # LLM — pick one
-LLM_PROVIDER=azure_openai                     # or azure_anthropic
+LLM_PROVIDER=azure_openai                     # azure_anthropic | openai_gateway
 
 # Azure OpenAI
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
@@ -58,6 +58,18 @@ AZURE_OPENAI_DEPLOYMENT=gpt-4o
 AZURE_ANTHROPIC_ENDPOINT=https://your-resource.services.ai.azure.com
 AZURE_ANTHROPIC_API_KEY=your-key
 AZURE_ANTHROPIC_DEPLOYMENT=claude-sonnet-4-6
+
+# OpenAI-compatible corporate gateway (alternative). Auth via `api-key` header + optional
+# workspace header. Prompt caching is AUTOMATIC on the gateway — no cache_control breakpoints;
+# the cache key just routes same-prefix requests to one node, retention extends its lifetime.
+# Verify hits via the "📦 r=…" line in chat (0 first turn, >0 once a stable prefix is reused).
+LLMGW_API_KEY=your-key
+LLMGW_API_BASE=https://gateway.example.com/v1
+LLMGW_MODEL=gpt-4o
+LLMGW_WORKSPACE=                              # optional; sent as the workspace header if set
+LLMGW_WORKSPACE_HEADER=workspacename          # header name for the workspace value
+LLMGW_PROMPT_CACHE_KEY=                       # optional; routes requests to a shared cache node
+LLMGW_PROMPT_CACHE_RETENTION=                 # "" (off) | in_memory | 24h
 
 # Redis (optional)
 REDIS_URL=redis://localhost:6379
@@ -113,7 +125,9 @@ main.py
 │   └── redis_cache.py — flow/starter cache (search, list, sync)
 ├── llm/
 │   ├── azure_openai.py
-│   └── azure_anthropic.py
+│   ├── azure_anthropic.py
+│   ├── openai_gateway.py — OpenAI-compatible corporate gateway (automatic prompt caching)
+│   └── openai_usage.py   — maps OpenAI usage → Usage (cached_tokens → cache_read_tokens)
 ├── config/
 │   └── settings.py   — pydantic-settings, reads .env
 └── templates/
