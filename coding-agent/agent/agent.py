@@ -15,8 +15,33 @@ from agent import planning
 from agent import designer
 from agent import pipeline
 from agent.context import summarize_history, compact_flow_snapshots
+from agent.events import ConsoleSink, slim_graph
 
 console = Console()
+
+
+# --- pure node helpers (module scope: used by both run_chat and run_turn) ---
+def _is_langmodel_node(n: dict) -> bool:
+    return any(
+        "LanguageModel" in (o.get("types") or o.get("output_types") or [])
+        for o in n.get("data", {}).get("node", {}).get("outputs", [])
+    )
+
+
+def _find_model_field(n: dict) -> str | None:
+    """Return template field name of the first ModelInput that accepts LanguageModel, or None."""
+    tmpl = n.get("data", {}).get("node", {}).get("template", {})
+    for k, v in tmpl.items():
+        if isinstance(v, dict) and v.get("type") == "model" and "LanguageModel" in (v.get("input_types") or []):
+            return k
+    return None
+
+
+def _has_only_tool_outputs(n: dict) -> bool:
+    """True if a node's only outputs are tool handles (component_as_tool/api_build_tool).
+    Such nodes MUST be used as Agent tools — they have no data output for pipeline use."""
+    outputs = n.get("data", {}).get("node", {}).get("outputs", [])
+    return bool(outputs) and all(o.get("name") in ("component_as_tool", "api_build_tool") for o in outputs)
 
 
 def _canonical_handle(handle):
@@ -427,26 +452,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
     # re-emits the payload (token-lean) and the design+confirm path stays authoritative.
     _approved_designs: dict[str, dict] = {}
 
-    def _is_langmodel_node(n: dict) -> bool:
-        return any(
-            "LanguageModel" in (o.get("types") or o.get("output_types") or [])
-            for o in n.get("data", {}).get("node", {}).get("outputs", [])
-        )
-
-    def _find_model_field(n: dict) -> str | None:
-        """Return template field name of the first ModelInput that accepts LanguageModel, or None."""
-        tmpl = n.get("data", {}).get("node", {}).get("template", {})
-        for k, v in tmpl.items():
-            if isinstance(v, dict) and v.get("type") == "model" and "LanguageModel" in (v.get("input_types") or []):
-                return k
-        return None
-
-    def _has_only_tool_outputs(n: dict) -> bool:
-        """True if a node's only outputs are tool handles (component_as_tool/api_build_tool).
-        Such nodes MUST be used as Agent tools — they have no data output for pipeline use."""
-        outputs = n.get("data", {}).get("node", {}).get("outputs", [])
-        return bool(outputs) and all(o.get("name") in ("component_as_tool", "api_build_tool") for o in outputs)
-
+    _console_sink = ConsoleSink()
     console.print(Panel(
         "[bold green]Langflow Coding Agent[/bold green]\n"
         "Type your request. Ctrl+C or 'exit' to quit.",
@@ -468,7 +474,44 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
             continue
 
         messages.append({"role": "user", "content": user_input})
+        messages = await run_turn(
+            llm, mcp, settings, mcp.get_tool_schemas(), messages,
+            _starter_cache, _console_sink,
+            todos=todos, scratchpad=scratchpad,
+            _intended_edges_by_flow=_intended_edges_by_flow,
+            _approved_designs=_approved_designs,
+        )
 
+
+async def run_turn(
+    llm: LLMProvider,
+    mcp: LangflowMCPClient,
+    settings: Settings,
+    tools,
+    messages: list[dict],
+    _starter_cache: dict,
+    sink,
+    *,
+    todos=None,
+    scratchpad=None,
+    _intended_edges_by_flow=None,
+    _approved_designs=None,
+    gate_state=None,
+    gate_confirm=False,
+) -> list[dict]:
+    """One agent turn: drive the tool loop until a final answer (or abort), emitting
+    structured signals through ``sink`` (ConsoleSink for the CLI = no-op; AGUISink for the
+    web server). ``messages`` already ends with the new user message. Returns updated history.
+    Persistent planning/design state is passed in so it survives across turns/threads."""
+    todos = [] if todos is None else todos
+    scratchpad = {} if scratchpad is None else scratchpad
+    _intended_edges_by_flow = {} if _intended_edges_by_flow is None else _intended_edges_by_flow
+    _approved_designs = {} if _approved_designs is None else _approved_designs
+    # Web turn-boundary gates: gate_state carries {"pending": None | {"kind","ref"}} across
+    # turns (the server persists it). When a gate fires in web mode we stash the pending
+    # marker, emit a confirm request, and end the turn — the next user reply resumes.
+    gate_state = {} if gate_state is None else gate_state
+    if True:
         iterations = 0
         prompt_tokens = 0
         completion_tokens = 0
@@ -478,6 +521,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
         # shown and approved, then the agent auto-locks through execution (the "auto
         # lock" behaviour) without re-prompting on subsequent status updates.
         _plan_confirmed = False
+        # The user approved the pending web gate (design/plan) on a prior turn — pre-confirm
+        # so this turn passes the gate and proceeds to build/execute without re-prompting.
+        if gate_confirm:
+            _plan_confirmed = True
+        # Set True when a web gate pauses this turn; the loop returns after the tool batch.
+        _gate_paused = False
         # True once propose_pipeline has surfaced open questions to the user this turn. When a
         # later propose_pipeline call comes back with no open questions, the user has actually
         # aligned the interpretation → we can auto-confirm the downstream design graph (no
@@ -544,7 +593,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 elapsed = time.perf_counter() - t0
             except (KeyboardInterrupt, asyncio.CancelledError):
                 console.print("\n[dim]Interrupted — back to prompt.[/dim]")
-                break  # abandon this turn only; keep the REPL (and conversation) alive
+                return messages  # abandon this turn only; conversation stays intact
             except Exception as e:
                 # A transient LLM/API error (timeout, dropped connection, 5xx) must NOT kill the
                 # session. The failed call appended nothing, so message history is still valid —
@@ -552,7 +601,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 console.print(f"\n[red]✗ LLM request failed:[/red] {type(e).__name__}: {e}")
                 console.print("[dim]Turn aborted — your session and context are intact. "
                               "Re-send your last message to retry.[/dim]")
-                break
+                return messages
 
             iter_prompt = 0
             iter_completion = 0
@@ -576,6 +625,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     if len(args_str) > 300:
                         args_str = args_str[:300] + "…"
                     console.print(f"[dim]→ {tc['name']}({args_str})[/dim]")
+                    sink.tool_call(tc["name"], tc["arguments"])
 
                 messages.append(_assistant_tool_call_message(response["tool_calls"]))
 
@@ -1234,14 +1284,13 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                             Markdown(pipeline.render_pipeline(stages)),
                             title="[bold]Proposed Pipeline[/bold]", border_style="cyan",
                         ))
+                        sink.notice(f"### 🧩 Proposed Pipeline\n\n{pipeline.render_pipeline(stages)}")
                         planning.remember(scratchpad, "pipeline", pipeline.render_pipeline(stages))
                         resolved, open_questions = pipeline.split(stages)
                         if open_questions:
                             _pipeline_asked = True
-                        elif _pipeline_asked:
-                            # The user has now answered the earlier questions → interpretation is
-                            # aligned. Auto-confirm the downstream design graph (one human gate).
-                            _plan_confirmed = True
+                        # The design confirmation is always its own gate — answering pipeline
+                        # questions aligns the interpretation but does NOT pre-approve the graph.
                         result = json.dumps(pipeline.build_result(resolved, open_questions))
                     elif tc["name"] == "design_flow":
                         # Delegate graph design to the in-process sub-agent (isolated context,
@@ -1267,20 +1316,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 Markdown(designer.render_design(spec)),
                                 title="[bold]Proposed Design[/bold]", border_style="cyan",
                             ))
+                            sink.notice(f"### 🧩 Proposed Design\n\n{designer.render_design(spec)}")
                             # Unresolved validation warnings force the human gate even when the
-                            # plan was auto-confirmed (e.g. via the propose_pipeline path).
+                            # design was pre-approved (gate_confirm from a prior turn).
                             approve = _plan_confirmed and not spec.get("violations")
-                            if not approve:
-                                try:
-                                    answer = console.input(
-                                        "[bold cyan]Proceed with this design? [y/n][/bold cyan] "
-                                    ).strip().lower()
-                                except (KeyboardInterrupt, EOFError):
-                                    answer = "n"
-                                if answer in ("y", "yes", ""):
-                                    approve = True
-                                    _plan_confirmed = True
-                            if approve:
+
+                            def _store_design() -> str:
                                 ref = f"d{len(_approved_designs) + 1}"
                                 _approved_designs[ref] = {
                                     "nodes": spec.get("nodes", []),
@@ -1288,22 +1329,51 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                     "prompt_template": spec.get("prompt_template", ""),
                                     "vars": spec.get("vars", []),
                                 }
+                                return ref
+
+                            if not approve and not sink.interactive:
+                                # Web: no stdin to block on. Stash the design so the next turn can
+                                # build it, surface a confirm request, and pause the turn — the
+                                # user's next reply (Approve → "yes", or feedback) resumes.
+                                ref = _store_design()
+                                gate_state["pending"] = {"kind": "design", "ref": ref}
+                                sink.confirm_request("design", designer.render_design(spec), ref)
+                                _gate_paused = True
                                 result = json.dumps({
-                                    "approved": True,
+                                    "status": "awaiting_confirmation",
                                     "design_ref": ref,
-                                    "summary": spec.get("summary", ""),
-                                    "next": f'Build it now: call create_flow with {{"data":{{"_design_ref":"{ref}"}}}}.',
+                                    "note": "Design shown to the user for approval. Do NOT build — "
+                                            "stop and wait for their reply.",
                                 })
                             else:
-                                feedback = console.input(
-                                    "[dim]What should change? (enter to skip)[/dim] "
-                                ).strip()
-                                _plan_rejected = True
-                                result = json.dumps({
-                                    "approved": False,
-                                    "feedback": feedback or "User rejected the design. Revise it.",
-                                    "note": "Call design_flow again with this feedback.",
-                                })
+                                if not approve:
+                                    try:
+                                        answer = console.input(
+                                            "[bold cyan]Proceed with this design? [y/n][/bold cyan] "
+                                        ).strip().lower()
+                                    except (KeyboardInterrupt, EOFError):
+                                        answer = "n"
+                                    if answer in ("y", "yes", ""):
+                                        approve = True
+                                        _plan_confirmed = True
+                                if approve:
+                                    ref = _store_design()
+                                    result = json.dumps({
+                                        "approved": True,
+                                        "design_ref": ref,
+                                        "summary": spec.get("summary", ""),
+                                        "next": f'Build it now: call create_flow with {{"data":{{"_design_ref":"{ref}"}}}}.',
+                                    })
+                                else:
+                                    feedback = console.input(
+                                        "[dim]What should change? (enter to skip)[/dim] "
+                                    ).strip()
+                                    _plan_rejected = True
+                                    result = json.dumps({
+                                        "approved": False,
+                                        "feedback": feedback or "User rejected the design. Revise it.",
+                                        "note": "Call design_flow again with this feedback.",
+                                    })
                     elif tc["name"] in planning.PLANNING_TOOL_NAMES:
                         _todos_before = [dict(t) for t in todos]
                         result = planning.dispatch(tc["name"], args, todos, scratchpad)
@@ -1315,6 +1385,7 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 Markdown(planning.render_todos(todos)),
                                 title="[bold]Plan[/bold]", border_style="cyan",
                             ))
+                            sink.notice(f"### 📋 Plan\n\n{planning.render_todos(todos)}")
                             # Confirm-gate ONCE per request, only for a real multi-step
                             # plan. After approval the agent auto-locks and won't re-prompt.
                             needs_gate = (
@@ -1322,6 +1393,20 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                                 and len(todos) >= 2
                                 and any(t["status"] != "completed" for t in todos)
                             )
+                            if needs_gate and not sink.interactive:
+                                # Web: pause for explicit approval (no stdin). The plan is shown
+                                # as a notice above; surface a confirm request and end the turn —
+                                # the user's next reply resumes execution.
+                                gate_state["pending"] = {"kind": "plan", "ref": None}
+                                sink.confirm_request("plan", planning.render_todos(todos), None)
+                                _gate_paused = True
+                                needs_gate = False
+                                result = json.dumps({
+                                    "ok": True,
+                                    "status": "awaiting_confirmation",
+                                    "note": "Plan shown to the user for approval. Do NOT execute — "
+                                            "stop and wait for their reply.",
+                                })
                             if needs_gate:
                                 try:
                                     answer = console.input(
@@ -1542,6 +1627,27 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
 
                     messages.append(_tool_result_message(tc["id"], str(result)))
 
+                # A web confirm gate fired this iteration: the proposal + confirm request are
+                # emitted, the pending marker is stored, and tool_use/tool_result pairing is
+                # intact. End the turn here — the user's next reply resumes (server-routed).
+                if _gate_paused:
+                    return messages
+
+                # Reflect any flow mutation on the web canvas: resolve the freshest flow id
+                # (auto-captured to scratchpad on create/update/clone) and emit a snapshot.
+                # ConsoleSink no-ops; AGUISink → STATE_SNAPSHOT so the dock refetches + merges.
+                if any(
+                    tc["name"] in ("create_flow", "update_flow", "build_flow",
+                                   "clone_starter_template", "delete_node")
+                    for tc in response["tool_calls"]
+                ):
+                    _fid = sink.flow_id
+                    for _k, _v in scratchpad.items():
+                        if _k.startswith("flow:") and _v:
+                            _fid = _v
+                    if _fid:
+                        sink.flow_built(_fid)
+
                 # Stall guard: if an iteration only called planning tools (no real work),
                 # the model is spinning on the plan instead of executing. Nudge, then abort.
                 if all(tc["name"] in planning.PLANNING_TOOL_NAMES for tc in response["tool_calls"]):
@@ -1559,12 +1665,14 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                     })
                 elif _stall >= 6:
                     console.print("[yellow]⚠ Planning loop detected — pausing. Tell me how to proceed.[/yellow]")
-                    break
+                    sink.final("⚠ Planning loop detected — paused. Tell me how to proceed.")
+                    return messages
 
                 iterations += 1
             else:
                 if response["content"]:
                     console.print(Markdown(response["content"]))
+                    sink.final(response["content"])
                 messages.append({"role": "assistant", "content": response["content"]})
                 if prompt_tokens or completion_tokens:
                     total_elapsed = time.perf_counter() - turn_start
@@ -1573,6 +1681,12 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                         f"{max(total_elapsed - tool_time, 0):.1f}s) · ↑{prompt_tokens:,} "
                         f"↓{completion_tokens:,} tokens[/dim]"
                     )
+                    sink.usage({
+                        "total": prompt_tokens + completion_tokens,
+                        "prompt": prompt_tokens,
+                        "completion": completion_tokens,
+                        "elapsed": round(total_elapsed, 1),
+                    })
                 # Compact fat flow snapshots (verification get_flow ~5K) before they carry
                 # into the next turn, then apply summarization.
                 compact_flow_snapshots(messages)
@@ -1580,6 +1694,9 @@ async def run_chat(llm: LLMProvider, mcp: LangflowMCPClient, settings: Settings)
                 # summarize the older prefix and keep the recent tail verbatim. Replaces
                 # the old last-2-user-turns trim, which discarded determinants and context.
                 messages = await summarize_history(llm, messages, settings)
-                break
+                return messages
         else:
             console.print("[yellow]⚠ Max tool iterations reached.[/yellow]")
+            sink.final("⚠ Reached the max tool-iteration limit for this turn. "
+                       "Tell me how to proceed or refine the request.")
+    return messages
