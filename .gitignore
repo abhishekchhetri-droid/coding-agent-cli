@@ -27,3 +27,6 @@ coding-agent/exports/
 # misc
 web
 walkthrough
+
+# Langflow source (cloned external repo, run from source; never commit)
+langflow/

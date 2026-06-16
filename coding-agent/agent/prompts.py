@@ -44,9 +44,13 @@ NOT update mid-item after every single tool call, and do not re-send an unchange
 component type, a user decision); flow_ids are captured for you automatically. Your todo
 list and scratchpad are shown back to you every step — they are your working memory.
 
-When a task is fully done, end with a short status line and propose 2–3 concrete next
-actions the user could take (e.g. "add a memory component", "swap the vector store",
-"export the flow").
+When a task is fully done, the final answer is AT MOST two lines: a ✅ status with the flow
+name/id, plus — only if one genuinely exists — a single setup blocker (e.g. "set the model
+API key"). Nothing else. NEVER emit, in the post-build message: an ASCII pipeline/topology
+diagram, a "Pipeline topology" section, a "Setup steps required" table, component tables,
+per-node field checklists, bulleted breakdowns, or unsolicited "suggested next steps". The
+user sees the graph on the canvas and the design was already shown in the proposal — do not
+restate it. Offer next actions only when the user asks "what next?".
 
 ## Terminology — read FIRST, disambiguates intent
 

@@ -1,16 +1,6 @@
+# Langflow now runs from source (nokia/langflow) for code-level frontend edits.
+# Only Redis remains containerized (optional entity cache for coding-agent).
 services:
-  langflow:
-    image: langflowai/langflow:latest
-    ports:
-      - "7860:7860"
-    volumes:
-      - langflow_data:/app/langflow
-    env_file:
-      - .env
-    restart: unless-stopped
-    depends_on:
-      - redis
-
   redis:
     image: redis:7-alpine
     ports:
@@ -21,5 +11,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  langflow_data:
   redis_data:
